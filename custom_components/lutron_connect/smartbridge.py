@@ -390,17 +390,22 @@ class ConnectSmartbridge(Smartbridge):
                 )
 
                 for button_json in cluster_buttons:
-                    self._load_connect_button(button_json, self.devices[eff_device_id])
+                    await self._load_connect_button(button_json, self.devices[eff_device_id])
 
         _LOGGER.debug(
             "ConnectSmartbridge: loaded %d buttons total", len(self.buttons)
         )
 
-    def _load_connect_button(self, button_json: dict, keypad_device: dict) -> None:
+    async def _load_connect_button(self, button_json: dict, keypad_device: dict) -> None:
         """Populate self.buttons for a single Connect Bridge button."""
         button_id = id_from_href(button_json["href"])
         button_number = button_json.get("ButtonNumber", 0)
         button_name = f"Button {button_number}"
+
+        button_led = None
+        associated_led = button_json.get("AssociatedLED")
+        if associated_led is not None:
+            button_led = id_from_href(associated_led["href"])
 
         self.buttons.setdefault(
             button_id,
@@ -416,10 +421,13 @@ class ConnectSmartbridge(Smartbridge):
             model=keypad_device["model"],
             serial=keypad_device["serial"],
             button_name=button_name,
-            button_led=None,
+            button_led=button_led,
             device_name=button_name,
             parent_device=keypad_device["device_id"],
         )
+
+        if button_led is not None:
+            await self._load_ra3_button_led(button_led, button_id, keypad_device)
 
     async def _subscribe_to_button_status(self) -> None:
         """Override parent's per-button subscription with the flat endpoint.
@@ -456,10 +464,21 @@ class ConnectSmartbridge(Smartbridge):
             except (KeyError, TypeError) as exc:
                 _LOGGER.warning("Malformed button status payload %s: %s", status, exc)
                 continue
+            _LOGGER.debug(
+                "Button event: id=%s event=%s known=%s subscribed=%s",
+                button_id, button_event,
+                button_id in self.buttons,
+                button_id in self._button_subscribers,
+            )
             if button_id in self.buttons:
                 self.buttons[button_id]["current_state"] = button_event
                 if button_id in self._button_subscribers:
-                    self._button_subscribers[button_id](button_event)
+                    try:
+                        self._button_subscribers[button_id](button_event)
+                    except Exception:
+                        _LOGGER.exception(
+                            "Error in button subscriber for button %s", button_id
+                        )
 
     def _handle_unsolicited(self, response) -> None:
         """Extend parent to catch untagged button events from the Connect Bridge."""
