@@ -4,43 +4,54 @@ The Connect Bridge reports ProductType "Lutron Connect Bridge Project", which is
 neither "Lutron RadioRA 3 Project" nor "Lutron HWQS Project", so pylutron_caseta
 falls into the Caseta branch and crashes on the missing DeviceType key.
 
-This subclass routes the Connect Bridge to the RA3 loading path (zones + areas),
-which matches the bridge's actual LEAP schema, and replaces _load_ra3_processor
-because the Connect Bridge device has no AssociatedArea field.
+The Connect Bridge also does not support per-area LEAP sub-resources
+(/area/{id}/associatedzone, /area/{id}/associatedcontrolstation), returning 405
+for each. Those 405 responses don't include a ClientTag, so pylutron_caseta's
+_request() waits the full REQUEST_TIMEOUT (5 s) per call — with 31 areas that
+adds up to >5 minutes before the bridge_timeout fires.
+
+This subclass implements a flat loading strategy:
+  - /zone          → all zone definitions (replaces per-area /associatedzone)
+  - /device?...    → all keypad devices   (replaces per-area /associatedcontrolstation)
+  - /zone/status   → zone state subscription (same as RA3, confirmed working)
 """
 
 from __future__ import annotations
 
 import logging
 
+from pylutron_caseta import BridgeResponseError, _LEAP_DEVICE_TYPES, BUTTON_STATUS_RELEASED
+from pylutron_caseta.leap import id_from_href
 from pylutron_caseta.smartbridge import Smartbridge
 
 _LOGGER = logging.getLogger(__name__)
+
+_SENSOR_TYPES = set(_LEAP_DEVICE_TYPES.get("sensor", []))
 
 
 class ConnectSmartbridge(Smartbridge):
     """Smartbridge variant for the Lutron Connect Bridge (HomeworksQS)."""
 
     async def _login(self):
-        """Connect and initialise the bridge using the RA3 device loading path."""
+        """Connect and initialise the bridge using flat LEAP endpoints."""
         _LOGGER.debug("ConnectSmartbridge: loading areas")
         await self._load_areas()
 
-        # Populate devices["1"] for the bridge itself.  We can't call the stock
-        # _load_ra3_processor() because that method requires processor["AssociatedArea"]
-        # which the Connect Bridge device does not include.
         _LOGGER.debug("ConnectSmartbridge: loading bridge device")
         await self._load_connect_bridge_device()
 
-        # Zones and control stations use the same RA3-style LEAP endpoints.
-        _LOGGER.debug("ConnectSmartbridge: loading RA3 devices (zones + keypads)")
-        await self._load_ra3_devices()
+        _LOGGER.debug("ConnectSmartbridge: loading zones via /zone")
+        await self._load_connect_zones()
+
+        _LOGGER.debug("ConnectSmartbridge: loading keypads via /device")
+        await self._load_connect_keypads()
+
+        _LOGGER.debug("ConnectSmartbridge: subscribing to zone status")
+        await self._subscribe_to_multi_zone_status()
 
         _LOGGER.debug("ConnectSmartbridge: subscribing to button status")
         await self._subscribe_to_button_status()
 
-        # Occupancy groups — the Connect Bridge may return an empty list; both
-        # methods handle that gracefully.
         _LOGGER.debug("ConnectSmartbridge: loading occupancy groups")
         await self._load_ra3_occupancy_groups()
 
@@ -51,10 +62,14 @@ class ConnectSmartbridge(Smartbridge):
 
     async def _load_connect_bridge_device(self):
         """Load the bridge itself as devices['1'] without requiring AssociatedArea."""
-        resp = await self._request("ReadRequest", "/device?where=IsThisDevice:true")
-        if resp.Body is None:
-            _LOGGER.warning("Could not load Connect Bridge device info")
-            # Provide a minimal placeholder so devices['1'] always exists.
+        try:
+            resp = await self._request("ReadRequest", "/device?where=IsThisDevice:true")
+        except BridgeResponseError as exc:
+            _LOGGER.warning("Could not load Connect Bridge device info: %s", exc)
+            resp = None
+
+        if resp is None or resp.Body is None:
+            _LOGGER.warning("Connect Bridge device info unavailable; using placeholder")
             self.devices.setdefault(
                 "1",
                 {
@@ -92,3 +107,165 @@ class ConnectSmartbridge(Smartbridge):
             device["Name"],
             device.get("SerialNumber"),
         )
+
+    async def _load_connect_zones(self):
+        """Load all zones from the flat /zone endpoint."""
+        try:
+            resp = await self._request("ReadRequest", "/zone")
+        except BridgeResponseError as exc:
+            _LOGGER.warning("Could not load zones from /zone: %s", exc)
+            return
+
+        if resp.Body is None:
+            _LOGGER.warning("Empty response from /zone")
+            return
+
+        zones = resp.Body.get("Zones", [])
+        _LOGGER.debug("ConnectSmartbridge: found %d zones", len(zones))
+
+        for zone in zones:
+            zone_id = id_from_href(zone["href"])
+            zone_name = zone.get("Name", f"Zone {zone_id}")
+            zone_type = zone.get("ControlType", "Dimmed")
+            level = zone.get("Level", -1)
+            fan_speed = zone.get("FanSpeed", None)
+
+            area_id = None
+            if "AssociatedArea" in zone:
+                area_id = id_from_href(zone["AssociatedArea"]["href"])
+
+            area_name = self.areas.get(area_id, {}).get("name", "") if area_id else ""
+
+            color_tuning = zone.get("ColorTuningProperties")
+            white_tuning_range = color_tuning.get("WhiteTuningLevelRange") if color_tuning else None
+
+            self.devices.setdefault(
+                zone_id,
+                {"device_id": zone_id, "current_state": level, "fan_speed": fan_speed},
+            ).update(
+                zone=zone_id,
+                name=f"{area_name}_{zone_name}" if area_name else zone_name,
+                button_groups=None,
+                type=zone_type,
+                model=None,
+                serial=None,
+                area=area_id,
+                device_name=zone_name,
+                white_tuning_range=white_tuning_range,
+            )
+
+        _LOGGER.debug("ConnectSmartbridge: loaded %d zone devices", len(zones))
+
+    async def _load_connect_keypads(self):
+        """Load all keypad/control-station devices from the flat /device endpoint."""
+        try:
+            resp = await self._request("ReadRequest", "/device?where=IsThisDevice:false")
+        except BridgeResponseError as exc:
+            _LOGGER.warning("Could not load devices from /device: %s", exc)
+            return
+
+        if resp.Body is None:
+            return
+
+        devices = resp.Body.get("Devices", [])
+        _LOGGER.debug("ConnectSmartbridge: found %d non-bridge devices", len(devices))
+
+        for device in devices:
+            device_type = device.get("DeviceType", "")
+            has_button_groups = "ButtonGroups" in device
+
+            # Only process devices that have buttons
+            if device_type not in _SENSOR_TYPES and not has_button_groups:
+                continue
+
+            device_id = id_from_href(device["href"])
+
+            try:
+                bg_resp = await self._request(
+                    "ReadRequest", f"/device/{device_id}/buttongroup/expanded"
+                )
+            except BridgeResponseError as exc:
+                _LOGGER.debug("No button groups for device %s: %s", device_id, exc)
+                continue
+
+            if bg_resp.Body is None:
+                continue
+
+            button_groups_expanded = bg_resp.Body.get("ButtonGroupsExpanded", [])
+            if not button_groups_expanded:
+                continue
+
+            device_name = device.get("Name", f"Device {device_id}")
+            device_model = device.get("ModelNumber", "")
+            device_serial = device.get("SerialNumber", None)
+
+            area_id = None
+            if "AssociatedArea" in device:
+                area_id = id_from_href(device["AssociatedArea"]["href"])
+
+            area_name = self.areas.get(area_id, {}).get("name", "") if area_id else ""
+
+            device_type_friendly = device_type
+            if "Pico" in device_type:
+                device_type_friendly = "Pico"
+            elif "Keypad" in device_type:
+                device_type_friendly = "Keypad"
+
+            button_group_ids = [
+                id_from_href(group["href"])
+                for group in button_groups_expanded
+            ]
+
+            combined_name = (
+                f"{area_name}_{device_name} {device_type_friendly}"
+                if area_name
+                else f"{device_name} {device_type_friendly}"
+            )
+
+            self.devices.setdefault(
+                device_id,
+                {"device_id": device_id, "current_state": -1, "fan_speed": None},
+            ).update(
+                zone=None,
+                name=combined_name,
+                button_groups=button_group_ids,
+                type=device_type,
+                model=device_model,
+                serial=device_serial,
+                device_name=device_name,
+                area=area_id,
+            )
+
+            _LOGGER.debug(
+                "Loaded keypad: %s (%s) in area %s with %d button group(s)",
+                device_name,
+                device_type,
+                area_name or "unassigned",
+                len(button_group_ids),
+            )
+
+            for bg_expanded in button_groups_expanded:
+                for button_json in bg_expanded.get("Buttons", []):
+                    await self._load_ra3_button(button_json, self.devices[device_id])
+
+        _LOGGER.debug(
+            "ConnectSmartbridge: loaded %d buttons total", len(self.buttons)
+        )
+
+    async def _load_ra3_occupancy_groups(self):
+        """Override to guard against missing DeviceType on Connect Bridge devices."""
+        from pylutron_caseta import RA3_OCCUPANCY_SENSOR_DEVICE_TYPES
+
+        try:
+            resp = await self._request("ReadRequest", "/device?where=IsThisDevice:false")
+        except BridgeResponseError as exc:
+            _LOGGER.warning("Could not load occupancy devices: %s", exc)
+            return
+
+        if resp.Body is None:
+            return
+
+        for device in resp.Body.get("Devices", []):
+            device_type = device.get("DeviceType")
+            if device_type and device_type in RA3_OCCUPANCY_SENSOR_DEVICE_TYPES:
+                self._process_ra3_occupancy_group(device)
