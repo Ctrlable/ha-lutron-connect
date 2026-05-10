@@ -234,12 +234,20 @@ def _async_subscribe_button_events(
     def _on_button_event(button_id: int, event_type):
         button = keypad_buttons.get(button_id)
         if not button:
+            _LOGGER.debug("_on_button_event: button_id=%s not in keypad_buttons", button_id)
             return
         keypad = keypads.get(button["parent_keypad"])
         if not keypad:
+            _LOGGER.debug("_on_button_event: parent_keypad=%s not in keypads", button["parent_keypad"])
             return
 
         action = ACTION_PRESS if event_type == BUTTON_STATUS_PRESSED else ACTION_RELEASE
+        _LOGGER.debug(
+            "Firing %s: area=%s device=%s button=%s action=%s",
+            LUTRON_CASETA_BUTTON_EVENT,
+            keypad.get("area_name"), keypad.get("name"),
+            button.get("button_name"), action,
+        )
         hass.bus.async_fire(
             LUTRON_CASETA_BUTTON_EVENT,
             {
