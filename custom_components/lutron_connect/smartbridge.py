@@ -33,8 +33,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import defaultdict
 from datetime import timedelta
-from typing import Optional
+from typing import Callable, Optional
 
 from pylutron_caseta import BridgeResponseError, BUTTON_STATUS_RELEASED
 from pylutron_caseta.leap import id_from_href
@@ -71,7 +72,13 @@ class ConnectSmartbridge(Smartbridge):
 
     async def _login(self):
         """Connect and initialise the bridge using flat LEAP endpoints."""
+        self.led_devices: dict[str, dict] = {}
+        self._led_subscribers: dict[str, Callable] = {}
+
         try:
+            _LOGGER.debug("ConnectSmartbridge: negotiating admin role")
+            await self._negotiate_admin_role()
+
             _LOGGER.debug("ConnectSmartbridge: loading areas")
             await self._load_areas()
 
@@ -89,6 +96,9 @@ class ConnectSmartbridge(Smartbridge):
 
             _LOGGER.debug("ConnectSmartbridge: subscribing to button status")
             await self._subscribe_to_button_status()
+
+            _LOGGER.debug("ConnectSmartbridge: subscribing to LED status")
+            await self._subscribe_to_connect_leds()
 
             _LOGGER.debug("ConnectSmartbridge: loading occupancy groups")
             await self._load_ra3_occupancy_groups()
@@ -327,6 +337,10 @@ class ConnectSmartbridge(Smartbridge):
         devices_sorted = sorted(devices_raw, key=lambda d: int(id_from_href(d["href"])))
         buttons_sorted = sorted(buttons_raw, key=lambda b: int(id_from_href(b["href"])))
 
+        # cluster_info collects (first_button_id_int, keypad_device_id, cluster_buttons)
+        # for LED discovery after all keypads are loaded.
+        cluster_info: list[tuple[int, str, list]] = []
+
         for i, device in enumerate(devices_sorted):
             device_id = id_from_href(device["href"])
             device_id_int = int(device_id)
@@ -392,9 +406,14 @@ class ConnectSmartbridge(Smartbridge):
                 for button_json in cluster_buttons:
                     await self._load_connect_button(button_json, self.devices[eff_device_id])
 
+                first_btn_id = int(id_from_href(cluster_buttons[0]["href"]))
+                cluster_info.append((first_btn_id, eff_device_id, list(cluster_buttons)))
+
         _LOGGER.debug(
             "ConnectSmartbridge: loaded %d buttons total", len(self.buttons)
         )
+
+        await self._discover_connect_leds(cluster_info)
 
     async def _load_connect_button(self, button_json: dict, keypad_device: dict) -> None:
         """Populate self.buttons for a single Connect Bridge button."""
@@ -428,6 +447,129 @@ class ConnectSmartbridge(Smartbridge):
 
         if button_led is not None:
             await self._load_ra3_button_led(button_led, button_id, keypad_device)
+
+    async def _negotiate_admin_role(self) -> None:
+        """Negotiate Admin role via /clientsetting to unlock LED endpoints."""
+        try:
+            await self._request(
+                "UpdateRequest",
+                "/clientsetting",
+                {"ClientSetting": {"ClientMajorVersion": 1}},
+            )
+            _LOGGER.debug("ConnectSmartbridge: Admin role negotiated")
+        except BridgeResponseError as exc:
+            _LOGGER.warning("ConnectSmartbridge: clientsetting negotiation failed: %s", exc)
+
+    async def _discover_connect_leds(
+        self, cluster_info: list[tuple[int, str, list]]
+    ) -> None:
+        """Probe IDs just before each cluster's first button to find LED resources.
+
+        On Connect Bridge firmware, LED IDs are allocated as a block immediately
+        before the first button ID of each physical keypad cluster.  They are only
+        accessible after Admin role negotiation (clientsetting).  SET is not
+        supported (405); LEDs are read-only indicators of scene/zone state.
+        """
+        sem = asyncio.Semaphore(20)
+
+        async def try_led(lid: int) -> tuple[int, str] | None:
+            async with sem:
+                try:
+                    resp = await asyncio.wait_for(
+                        self._request("ReadRequest", f"/led/{lid}/status"),
+                        timeout=3,
+                    )
+                    if resp and resp.Body:
+                        state = resp.Body.get("LEDStatus", {}).get("State", "Off")
+                        return (lid, state)
+                except Exception:
+                    pass
+                return None
+
+        # Build tasks for all clusters simultaneously, limited by semaphore.
+        tasks_meta: list[tuple[int, str, list]] = []  # (led_id_int, keypad_device_id, buttons_sorted)
+        for first_btn_id, keypad_device_id, cluster_buttons in cluster_info:
+            buttons_sorted = sorted(
+                cluster_buttons,
+                key=lambda b: b.get("ButtonNumber", int(id_from_href(b["href"]))),
+            )
+            for offset in range(1, 9):
+                tasks_meta.append((first_btn_id - offset, keypad_device_id, buttons_sorted))
+
+        results = await asyncio.gather(*[try_led(lid) for lid, _, _ in tasks_meta])
+
+        # Group found LEDs by keypad, preserving order (sorted by led_id).
+        grouped: dict[str, list[tuple[int, str, list]]] = defaultdict(list)
+        for (led_id, keypad_device_id, buttons_sorted), result in zip(tasks_meta, results):
+            if result is not None:
+                grouped[keypad_device_id].append((led_id, result[1], buttons_sorted))
+
+        for keypad_device_id, entries in grouped.items():
+            found = sorted(entries, key=lambda x: x[0])  # sort by led_id ascending
+            buttons_sorted = found[0][2]
+            for i, (led_id, state, _) in enumerate(found):
+                btn_number = (
+                    buttons_sorted[i].get("ButtonNumber", i + 1)
+                    if i < len(buttons_sorted)
+                    else i + 1
+                )
+                self.led_devices[str(led_id)] = {
+                    "led_id": str(led_id),
+                    "keypad_device_id": keypad_device_id,
+                    "button_number": btn_number,
+                    "state": state,
+                }
+
+        _LOGGER.debug("ConnectSmartbridge: discovered %d LED devices", len(self.led_devices))
+
+    async def _subscribe_to_connect_leds(self) -> None:
+        """Subscribe to /led/{id}/status for every discovered LED."""
+        if not self.led_devices:
+            _LOGGER.debug("ConnectSmartbridge: no LED devices to subscribe")
+            return
+
+        sem = asyncio.Semaphore(10)
+
+        async def sub_one(led_id: str) -> None:
+            async with sem:
+                try:
+                    await self._subscribe(
+                        f"/led/{led_id}/status",
+                        self._handle_led_status,
+                    )
+                except Exception as exc:
+                    _LOGGER.debug("LED %s subscribe failed: %s", led_id, exc)
+
+        await asyncio.gather(*[sub_one(lid) for lid in self.led_devices])
+        _LOGGER.debug("ConnectSmartbridge: subscribed to %d LEDs", len(self.led_devices))
+
+    def _handle_led_status(self, response) -> None:
+        """Handle LEDStatus update from a subscribed /led/{id}/status endpoint."""
+        if response.Body is None:
+            return
+        led_status = response.Body.get("LEDStatus")
+        if not led_status:
+            return
+        led_href = (led_status.get("LED") or {}).get("href", "")
+        if not led_href:
+            led_href = led_status.get("href", "").replace("/status", "")
+        if not led_href:
+            return
+        led_id = id_from_href(led_href)
+        state = led_status.get("State", "Off")
+        if led_id not in self.led_devices:
+            return
+        self.led_devices[led_id]["state"] = state
+        cb = self._led_subscribers.get(led_id)
+        if cb:
+            try:
+                cb(state)
+            except Exception:
+                _LOGGER.exception("Error in LED subscriber for LED %s", led_id)
+
+    def add_led_subscriber(self, led_id: str, callback: Callable[[str], None]) -> None:
+        """Register a callback invoked with the new State ('On'/'Off') on LED changes."""
+        self._led_subscribers[led_id] = callback
 
     async def _subscribe_to_button_status(self) -> None:
         """Override parent's per-button subscription with the flat endpoint.

@@ -30,11 +30,63 @@ async def async_setup_entry(
     bridge = data.bridge
     bridge_unique_id = _serial_to_unique_id(data.bridge_device["serial"])
 
-    entities = [
+    entities: list = [
         LutronConnectOccupancySensor(group_id, group, data, bridge_unique_id)
         for group_id, group in bridge.occupancy_groups.items()
     ]
+    entities += [
+        LutronConnectKeypadLED(led_id, led, data)
+        for led_id, led in getattr(bridge, "led_devices", {}).items()
+    ]
     async_add_entities(entities, True)
+
+
+class LutronConnectKeypadLED(BinarySensorEntity):
+    """A keypad button LED indicator — read-only, state managed by the HWQS processor."""
+
+    _attr_should_poll = False
+
+    def __init__(self, led_id: str, led: dict[str, Any], data: LutronConnectData) -> None:
+        self._led_id = led_id
+        self._bridge = data.bridge
+        bridge_unique_id = _serial_to_unique_id(data.bridge_device["serial"])
+        self._attr_unique_id = f"led_{bridge_unique_id}_{led_id}"
+
+        keypad_dev_id = led.get("keypad_device_id")
+        bridge_devices = data.bridge.get_devices()
+        keypad = bridge_devices.get(keypad_dev_id) if keypad_dev_id else None
+        button_number = led.get("button_number", "?")
+
+        if keypad:
+            area = _area_name(data.bridge.areas, keypad.get("area"))
+            keypad_name = keypad["name"].split("_")[-1]
+            self._attr_name = f"{area} {keypad_name} Button {button_number} LED"
+            serial = (
+                keypad.get("serial")
+                or f"{data.bridge_device['serial']}_{keypad_dev_id}"
+            )
+            info = DeviceInfo(
+                identifiers={(DOMAIN, serial)},
+                manufacturer=MANUFACTURER,
+                name=f"{area} {keypad_name}",
+                model=f"{keypad.get('model') or ''} ({keypad.get('type') or ''})",
+                via_device=(DOMAIN, data.bridge_device["serial"]),
+                configuration_url=CONFIG_URL,
+            )
+            if area != UNASSIGNED_AREA:
+                info["suggested_area"] = area
+            self._attr_device_info = info
+        else:
+            self._attr_name = f"LED {led_id}"
+
+        self._attr_is_on = led.get("state") == "On"
+
+    async def async_added_to_hass(self) -> None:
+        self._bridge.add_led_subscriber(self._led_id, self._on_state_change)
+
+    def _on_state_change(self, state: str) -> None:
+        self._attr_is_on = state == "On"
+        self.async_write_ha_state()
 
 
 class LutronConnectOccupancySensor(BinarySensorEntity):
