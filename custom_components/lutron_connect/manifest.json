@@ -1,0 +1,20 @@
+{
+  "domain": "lutron_connect",
+  "name": "Lutron Connect Bridge",
+  "version": "1.0.0",
+  "description": "Support for Lutron Connect Bridge (HomeworksQS) via LEAP protocol.",
+  "documentation": "https://github.com/Ctrlable/ha-lutron-connect",
+  "dependencies": [],
+  "codeowners": ["@ctrlable"],
+  "requirements": ["pylutron-caseta>=0.20.0"],
+  "iot_class": "local_push",
+  "config_flow": true,
+  "zeroconf": [
+    {
+      "type": "_lutron._tcp.local.",
+      "properties": {
+        "SYSTYPE": "ConnectBridge*"
+      }
+    }
+  ]
+}

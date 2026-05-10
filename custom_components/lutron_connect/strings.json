@@ -1,0 +1,24 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Set up Lutron Connect Bridge",
+        "description": "Enter the IP address or hostname of your Lutron Connect Bridge.",
+        "data": {
+          "host": "Host"
+        }
+      },
+      "link": {
+        "title": "Press the button on your Lutron Connect Bridge",
+        "description": "Press the small black button on the back of the Connect Bridge at **{host}** to complete pairing, then click Submit.\n\nIf the bridge was already paired, click Submit to reconnect."
+      }
+    },
+    "error": {
+      "cannot_connect": "Cannot connect to the bridge. Check the IP address and try again."
+    },
+    "abort": {
+      "already_configured": "This bridge is already configured.",
+      "not_lutron_device": "Discovered device is not a Lutron device."
+    }
+  }
+}
