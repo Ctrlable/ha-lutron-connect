@@ -348,6 +348,49 @@ class ConnectSmartbridge(Smartbridge):
             "ConnectSmartbridge: loaded %d buttons total", len(self.buttons)
         )
 
+    async def _subscribe_to_button_status(self) -> None:
+        """Override parent's per-button subscription with the flat endpoint.
+
+        The Connect Bridge does not support /button/{id}/status/event (returns 405).
+        The flat /button/status/event endpoint works and sends MultipleButtonStatusEvent
+        messages for every button press on any keypad.
+        """
+        _LOGGER.debug("ConnectSmartbridge: subscribing to flat /button/status/event")
+        try:
+            await self._subscribe(
+                "/button/status/event",
+                self._handle_connect_button_status,
+            )
+            _LOGGER.debug("ConnectSmartbridge: subscribed to /button/status/event")
+        except BridgeResponseError as ex:
+            _LOGGER.warning(
+                "ConnectSmartbridge: failed to subscribe to button status: %s", ex
+            )
+
+    def _handle_connect_button_status(self, response) -> None:
+        """Handle MultipleButtonStatusEvent from the flat button subscription."""
+        if response.Body is None:
+            return
+        statuses = response.Body.get("ButtonStatuses") or []
+        if not statuses:
+            single = response.Body.get("ButtonStatus")
+            if single:
+                statuses = [single]
+        for status in statuses:
+            button_id = id_from_href(status["Button"]["href"])
+            button_event = status["ButtonEvent"]["EventType"]
+            if button_id in self.buttons:
+                self.buttons[button_id]["current_state"] = button_event
+                if button_id in self._button_subscribers:
+                    self._button_subscribers[button_id](button_event)
+
+    def _handle_unsolicited(self, response) -> None:
+        """Extend parent to catch untagged button events from the Connect Bridge."""
+        super()._handle_unsolicited(response)
+        mbt = response.Header.MessageBodyType
+        if mbt in ("MultipleButtonStatusEvent", "OneButtonStatusEvent"):
+            self._handle_connect_button_status(response)
+
     async def _load_ra3_occupancy_groups(self):
         """Override to guard against missing DeviceType on Connect Bridge devices."""
         from pylutron_caseta import RA3_OCCUPANCY_SENSOR_DEVICE_TYPES
