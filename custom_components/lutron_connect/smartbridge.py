@@ -19,6 +19,14 @@ Correct command formats confirmed on Connect Bridge firmware 08.01.09f000:
   - Shade zones:    GoToShadeLevel   + ShadeLevelParameters:   {"Level": 0-100}
   - Raise/Lower/Stop work on all shade zones
   - GoToLevel returns 405 on all zone types (not supported)
+
+Button cluster detection:
+  On HWQS systems consecutive buttons within the same physical keypad have LEAP IDs
+  that differ by 2–8.  Buttons that belong to a DIFFERENT physical keypad (one that
+  does not appear in /device) appear in the same numeric "gap" but are separated by
+  IDs in the hundreds or thousands.  _CLUSTER_GAP_THRESHOLD (30) is well above the
+  normal intra-keypad gap (≤ 4) and well below the smallest observed inter-keypad gap
+  (38, confirmed on firmware 08.01.09f000).
 """
 
 from __future__ import annotations
@@ -34,11 +42,28 @@ from pylutron_caseta.smartbridge import Smartbridge
 
 _LOGGER = logging.getLogger(__name__)
 
+_CLUSTER_GAP_THRESHOLD = 30
+
+
 def _leap_duration(td: timedelta) -> str:
     total = int(td.total_seconds())
     h, rem = divmod(total, 3600)
     m, s = divmod(rem, 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def _split_button_clusters(buttons: list) -> list[list]:
+    """Group a sorted button list into clusters; a gap > _CLUSTER_GAP_THRESHOLD signals a new physical device."""
+    if not buttons:
+        return []
+    clusters: list[list] = [[buttons[0]]]
+    for b in buttons[1:]:
+        prev_id = int(id_from_href(clusters[-1][-1]["href"]))
+        curr_id = int(id_from_href(b["href"]))
+        if curr_id - prev_id > _CLUSTER_GAP_THRESHOLD:
+            clusters.append([])
+        clusters[-1].append(b)
+    return clusters
 
 
 class ConnectSmartbridge(Smartbridge):
@@ -146,6 +171,19 @@ class ConnectSmartbridge(Smartbridge):
         await super().lower_cover(device_id)
         if device_id in self._subscribers:
             self._subscribers[device_id]()
+
+    async def tap_button(self, button_id: str) -> None:
+        """Simulate a button press on the Connect Bridge via /button/{id}/commandprocessor."""
+        if button_id not in self.buttons:
+            return
+        try:
+            await self._request(
+                "CreateRequest",
+                f"/button/{button_id}/commandprocessor",
+                {"Command": {"CommandType": "PressAndRelease"}},
+            )
+        except BridgeResponseError as exc:
+            _LOGGER.warning("tap_button %s failed: %s", button_id, exc)
 
     def _handle_zone_status(self, status: dict) -> None:
         """Translate SwitchedLevel into a numeric Level before delegating."""
@@ -256,9 +294,12 @@ class ConnectSmartbridge(Smartbridge):
         /device/{id}/buttongroup/expanded.  Instead:
           - All physical keypad devices appear in /device?where=IsThisDevice:false
           - All buttons appear in /button with ButtonNumber and no parent reference
-          - Button IDs are always numerically between their parent device's ID and
-            the next device's ID (confirmed on firmware 08.01.09f000), so we assign
-            buttons to devices by sorted ID proximity.
+          - Button IDs cluster numerically after their parent device ID.
+
+        When multiple physical keypads lack individual /device entries (e.g. WPMs and
+        shade-only controllers), their buttons appear in the ID range of the nearest
+        listed device.  _split_button_clusters() separates them using the large ID gap
+        between clusters; each extra cluster becomes a virtual device entry.
         """
         try:
             resp = await self._request("ReadRequest", "/device?where=IsThisDevice:false")
@@ -283,7 +324,6 @@ class ConnectSmartbridge(Smartbridge):
         )
         _LOGGER.debug("ConnectSmartbridge: found %d buttons", len(buttons_raw))
 
-        # Sort both by numeric ID so we can slice by ID range.
         devices_sorted = sorted(devices_raw, key=lambda d: int(id_from_href(d["href"])))
         buttons_sorted = sorted(buttons_raw, key=lambda b: int(id_from_href(b["href"])))
 
@@ -306,7 +346,6 @@ class ConnectSmartbridge(Smartbridge):
 
             device_name = device.get("Name", f"Device {device_id}")
             device_serial = device.get("SerialNumber")
-            fqn = device.get("FullyQualifiedName", [])
 
             area_id = None
             if "AssociatedArea" in device:
@@ -314,32 +353,44 @@ class ConnectSmartbridge(Smartbridge):
 
             area_name = self.areas.get(area_id, {}).get("name", "") if area_id else ""
 
-            # Build a unique human-readable name; append device_id when >1 CSD per area.
-            combined_name = f"{area_name}_{device_name}" if area_name else device_name
+            clusters = _split_button_clusters(my_buttons)
 
-            self.devices.setdefault(
-                device_id,
-                {"device_id": device_id, "current_state": -1, "fan_speed": None},
-            ).update(
-                zone=None,
-                name=combined_name,
-                button_groups=[],
-                type="CSD",
-                model=None,
-                serial=device_serial,
-                device_name=device_name,
-                area=area_id,
-            )
+            for cluster_idx, cluster_buttons in enumerate(clusters):
+                if cluster_idx == 0:
+                    eff_device_id = device_id
+                    eff_serial = device_serial
+                    eff_name = device_name
+                else:
+                    eff_device_id = f"{device_id}_x{cluster_idx}"
+                    eff_serial = None
+                    eff_name = f"{device_name} ({cluster_idx})"
 
-            _LOGGER.debug(
-                "Loaded keypad: %s in area %s with %d button(s)",
-                device_name,
-                area_name or "unassigned",
-                len(my_buttons),
-            )
+                combined_name = f"{area_name}_{eff_name}" if area_name else eff_name
 
-            for button_json in my_buttons:
-                self._load_connect_button(button_json, self.devices[device_id])
+                self.devices.setdefault(
+                    eff_device_id,
+                    {"device_id": eff_device_id, "current_state": -1, "fan_speed": None},
+                ).update(
+                    zone=None,
+                    name=combined_name,
+                    button_groups=[],
+                    type="CSD",
+                    model=None,
+                    serial=eff_serial,
+                    device_name=eff_name,
+                    area=area_id,
+                )
+
+                _LOGGER.debug(
+                    "Loaded%s keypad: %s in area %s with %d button(s)",
+                    " virtual" if cluster_idx > 0 else "",
+                    eff_name,
+                    area_name or "unassigned",
+                    len(cluster_buttons),
+                )
+
+                for button_json in cluster_buttons:
+                    self._load_connect_button(button_json, self.devices[eff_device_id])
 
         _LOGGER.debug(
             "ConnectSmartbridge: loaded %d buttons total", len(self.buttons)
@@ -377,7 +428,7 @@ class ConnectSmartbridge(Smartbridge):
         The flat /button/status/event endpoint works and sends MultipleButtonStatusEvent
         messages for every button press on any keypad.
         """
-        _LOGGER.debug("ConnectSmartbridge: subscribing to flat /button/status/event")
+        _LOGGER.debug("ConnectSmartbridge: subscribing to /button/status/event")
         try:
             await self._subscribe(
                 "/button/status/event",
@@ -399,8 +450,12 @@ class ConnectSmartbridge(Smartbridge):
             if single:
                 statuses = [single]
         for status in statuses:
-            button_id = id_from_href(status["Button"]["href"])
-            button_event = status["ButtonEvent"]["EventType"]
+            try:
+                button_id = id_from_href(status["Button"]["href"])
+                button_event = status["ButtonEvent"]["EventType"]
+            except (KeyError, TypeError) as exc:
+                _LOGGER.warning("Malformed button status payload %s: %s", status, exc)
+                continue
             if button_id in self.buttons:
                 self.buttons[button_id]["current_state"] = button_event
                 if button_id in self._button_subscribers:
