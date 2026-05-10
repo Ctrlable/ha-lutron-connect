@@ -18,6 +18,7 @@ This subclass implements a flat loading strategy:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from pylutron_caseta import BridgeResponseError, _LEAP_DEVICE_TYPES, BUTTON_STATUS_RELEASED
@@ -34,31 +35,41 @@ class ConnectSmartbridge(Smartbridge):
 
     async def _login(self):
         """Connect and initialise the bridge using flat LEAP endpoints."""
-        _LOGGER.debug("ConnectSmartbridge: loading areas")
-        await self._load_areas()
+        try:
+            _LOGGER.debug("ConnectSmartbridge: loading areas")
+            await self._load_areas()
 
-        _LOGGER.debug("ConnectSmartbridge: loading bridge device")
-        await self._load_connect_bridge_device()
+            _LOGGER.debug("ConnectSmartbridge: loading bridge device")
+            await self._load_connect_bridge_device()
 
-        _LOGGER.debug("ConnectSmartbridge: loading zones via /zone")
-        await self._load_connect_zones()
+            _LOGGER.debug("ConnectSmartbridge: loading zones via /zone")
+            await self._load_connect_zones()
 
-        _LOGGER.debug("ConnectSmartbridge: loading keypads via /device")
-        await self._load_connect_keypads()
+            _LOGGER.debug("ConnectSmartbridge: loading keypads via /device")
+            await self._load_connect_keypads()
 
-        _LOGGER.debug("ConnectSmartbridge: subscribing to zone status")
-        await self._subscribe_to_multi_zone_status()
+            _LOGGER.debug("ConnectSmartbridge: subscribing to zone status")
+            await self._subscribe_to_multi_zone_status()
 
-        _LOGGER.debug("ConnectSmartbridge: subscribing to button status")
-        await self._subscribe_to_button_status()
+            _LOGGER.debug("ConnectSmartbridge: subscribing to button status")
+            await self._subscribe_to_button_status()
 
-        _LOGGER.debug("ConnectSmartbridge: loading occupancy groups")
-        await self._load_ra3_occupancy_groups()
+            _LOGGER.debug("ConnectSmartbridge: loading occupancy groups")
+            await self._load_ra3_occupancy_groups()
 
-        _LOGGER.debug("ConnectSmartbridge: subscribing to occupancy groups")
-        await self._subscribe_to_ra3_occupancy_groups()
+            _LOGGER.debug("ConnectSmartbridge: subscribing to occupancy groups")
+            await self._subscribe_to_ra3_occupancy_groups()
 
-        _LOGGER.debug("ConnectSmartbridge: login complete")
+            _LOGGER.debug("ConnectSmartbridge: login complete")
+
+            if not self._login_completed.done():
+                self._login_completed.set_result(None)
+        except asyncio.CancelledError:
+            pass
+        except Exception as ex:
+            if not self._login_completed.done():
+                self._login_completed.set_exception(ex)
+            raise
 
     async def _load_connect_bridge_device(self):
         """Load the bridge itself as devices['1'] without requiring AssociatedArea."""
