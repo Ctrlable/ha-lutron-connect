@@ -28,14 +28,11 @@ import logging
 from datetime import timedelta
 from typing import Optional
 
-from pylutron_caseta import BridgeResponseError, _LEAP_DEVICE_TYPES, BUTTON_STATUS_RELEASED
+from pylutron_caseta import BridgeResponseError, BUTTON_STATUS_RELEASED
 from pylutron_caseta.leap import id_from_href
 from pylutron_caseta.smartbridge import Smartbridge
 
 _LOGGER = logging.getLogger(__name__)
-
-_SENSOR_TYPES = set(_LEAP_DEVICE_TYPES.get("sensor", []))
-
 
 def _leap_duration(td: timedelta) -> str:
     total = int(td.total_seconds())
@@ -253,7 +250,16 @@ class ConnectSmartbridge(Smartbridge):
         _LOGGER.debug("ConnectSmartbridge: loaded %d zone devices", len(zones))
 
     async def _load_connect_keypads(self):
-        """Load all keypad/control-station devices from the flat /device endpoint."""
+        """Load keypad devices and buttons for the Connect Bridge.
+
+        The Connect Bridge does not expose DeviceType, ButtonGroups, or
+        /device/{id}/buttongroup/expanded.  Instead:
+          - All physical keypad devices appear in /device?where=IsThisDevice:false
+          - All buttons appear in /button with ButtonNumber and no parent reference
+          - Button IDs are always numerically between their parent device's ID and
+            the next device's ID (confirmed on firmware 08.01.09f000), so we assign
+            buttons to devices by sorted ID proximity.
+        """
         try:
             resp = await self._request("ReadRequest", "/device?where=IsThisDevice:false")
         except BridgeResponseError as exc:
@@ -263,37 +269,44 @@ class ConnectSmartbridge(Smartbridge):
         if resp.Body is None:
             return
 
-        devices = resp.Body.get("Devices", [])
-        _LOGGER.debug("ConnectSmartbridge: found %d non-bridge devices", len(devices))
+        devices_raw = resp.Body.get("Devices", [])
+        _LOGGER.debug("ConnectSmartbridge: found %d non-bridge devices", len(devices_raw))
 
-        for device in devices:
-            device_type = device.get("DeviceType", "")
-            has_button_groups = "ButtonGroups" in device
+        try:
+            btn_resp = await self._request("ReadRequest", "/button")
+        except BridgeResponseError as exc:
+            _LOGGER.warning("Could not load buttons from /button: %s", exc)
+            btn_resp = None
 
-            # Only process devices that have buttons
-            if device_type not in _SENSOR_TYPES and not has_button_groups:
-                continue
+        buttons_raw = (
+            btn_resp.Body.get("Buttons", []) if (btn_resp and btn_resp.Body) else []
+        )
+        _LOGGER.debug("ConnectSmartbridge: found %d buttons", len(buttons_raw))
 
+        # Sort both by numeric ID so we can slice by ID range.
+        devices_sorted = sorted(devices_raw, key=lambda d: int(id_from_href(d["href"])))
+        buttons_sorted = sorted(buttons_raw, key=lambda b: int(id_from_href(b["href"])))
+
+        for i, device in enumerate(devices_sorted):
             device_id = id_from_href(device["href"])
+            device_id_int = int(device_id)
+            next_id_int = (
+                int(id_from_href(devices_sorted[i + 1]["href"]))
+                if i + 1 < len(devices_sorted)
+                else 10 ** 9
+            )
 
-            try:
-                bg_resp = await self._request(
-                    "ReadRequest", f"/device/{device_id}/buttongroup/expanded"
-                )
-            except BridgeResponseError as exc:
-                _LOGGER.debug("No button groups for device %s: %s", device_id, exc)
-                continue
+            my_buttons = [
+                b for b in buttons_sorted
+                if device_id_int < int(id_from_href(b["href"])) < next_id_int
+            ]
 
-            if bg_resp.Body is None:
-                continue
-
-            button_groups_expanded = bg_resp.Body.get("ButtonGroupsExpanded", [])
-            if not button_groups_expanded:
-                continue
+            if not my_buttons:
+                continue  # WPMs, phantom keypads, or devices with no buttons
 
             device_name = device.get("Name", f"Device {device_id}")
-            device_model = device.get("ModelNumber", "")
-            device_serial = device.get("SerialNumber", None)
+            device_serial = device.get("SerialNumber")
+            fqn = device.get("FullyQualifiedName", [])
 
             area_id = None
             if "AssociatedArea" in device:
@@ -301,22 +314,8 @@ class ConnectSmartbridge(Smartbridge):
 
             area_name = self.areas.get(area_id, {}).get("name", "") if area_id else ""
 
-            device_type_friendly = device_type
-            if "Pico" in device_type:
-                device_type_friendly = "Pico"
-            elif "Keypad" in device_type:
-                device_type_friendly = "Keypad"
-
-            button_group_ids = [
-                id_from_href(group["href"])
-                for group in button_groups_expanded
-            ]
-
-            combined_name = (
-                f"{area_name}_{device_name} {device_type_friendly}"
-                if area_name
-                else f"{device_name} {device_type_friendly}"
-            )
+            # Build a unique human-readable name; append device_id when >1 CSD per area.
+            combined_name = f"{area_name}_{device_name}" if area_name else device_name
 
             self.devices.setdefault(
                 device_id,
@@ -324,28 +323,51 @@ class ConnectSmartbridge(Smartbridge):
             ).update(
                 zone=None,
                 name=combined_name,
-                button_groups=button_group_ids,
-                type=device_type,
-                model=device_model,
+                button_groups=[],
+                type="CSD",
+                model=None,
                 serial=device_serial,
                 device_name=device_name,
                 area=area_id,
             )
 
             _LOGGER.debug(
-                "Loaded keypad: %s (%s) in area %s with %d button group(s)",
+                "Loaded keypad: %s in area %s with %d button(s)",
                 device_name,
-                device_type,
                 area_name or "unassigned",
-                len(button_group_ids),
+                len(my_buttons),
             )
 
-            for bg_expanded in button_groups_expanded:
-                for button_json in bg_expanded.get("Buttons", []):
-                    await self._load_ra3_button(button_json, self.devices[device_id])
+            for button_json in my_buttons:
+                self._load_connect_button(button_json, self.devices[device_id])
 
         _LOGGER.debug(
             "ConnectSmartbridge: loaded %d buttons total", len(self.buttons)
+        )
+
+    def _load_connect_button(self, button_json: dict, keypad_device: dict) -> None:
+        """Populate self.buttons for a single Connect Bridge button."""
+        button_id = id_from_href(button_json["href"])
+        button_number = button_json.get("ButtonNumber", 0)
+        button_name = f"Button {button_number}"
+
+        self.buttons.setdefault(
+            button_id,
+            {
+                "device_id": button_id,
+                "current_state": BUTTON_STATUS_RELEASED,
+                "button_number": button_number,
+                "button_group": None,
+            },
+        ).update(
+            name=keypad_device["name"],
+            type=keypad_device["type"],
+            model=keypad_device["model"],
+            serial=keypad_device["serial"],
+            button_name=button_name,
+            button_led=None,
+            device_name=button_name,
+            parent_device=keypad_device["device_id"],
         )
 
     async def _subscribe_to_button_status(self) -> None:
