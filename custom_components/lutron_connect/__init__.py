@@ -8,7 +8,8 @@ import ssl
 from typing import Any, cast
 
 from pylutron_caseta import BUTTON_STATUS_PRESSED
-from pylutron_caseta.smartbridge import Smartbridge
+
+from .smartbridge import ConnectSmartbridge
 
 from homeassistant import config_entries
 from homeassistant.const import ATTR_DEVICE_ID, ATTR_SUGGESTED_AREA, CONF_HOST, Platform
@@ -64,7 +65,7 @@ async def async_setup_entry(
     ca_certs = hass.config.path(config_entry.data[CONF_CA_CERTS])
 
     try:
-        bridge = Smartbridge.create_tls(
+        bridge = ConnectSmartbridge.create_tls(
             hostname=host,
             keyfile=keyfile,
             certfile=certfile,
