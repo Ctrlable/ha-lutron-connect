@@ -23,21 +23,31 @@ class ConnectSmartbridge(Smartbridge):
 
     async def _login(self):
         """Connect and initialise the bridge using the RA3 device loading path."""
+        _LOGGER.debug("ConnectSmartbridge: loading areas")
         await self._load_areas()
 
         # Populate devices["1"] for the bridge itself.  We can't call the stock
         # _load_ra3_processor() because that method requires processor["AssociatedArea"]
         # which the Connect Bridge device does not include.
+        _LOGGER.debug("ConnectSmartbridge: loading bridge device")
         await self._load_connect_bridge_device()
 
         # Zones and control stations use the same RA3-style LEAP endpoints.
+        _LOGGER.debug("ConnectSmartbridge: loading RA3 devices (zones + keypads)")
         await self._load_ra3_devices()
+
+        _LOGGER.debug("ConnectSmartbridge: subscribing to button status")
         await self._subscribe_to_button_status()
 
         # Occupancy groups — the Connect Bridge may return an empty list; both
         # methods handle that gracefully.
+        _LOGGER.debug("ConnectSmartbridge: loading occupancy groups")
         await self._load_ra3_occupancy_groups()
+
+        _LOGGER.debug("ConnectSmartbridge: subscribing to occupancy groups")
         await self._subscribe_to_ra3_occupancy_groups()
+
+        _LOGGER.debug("ConnectSmartbridge: login complete")
 
     async def _load_connect_bridge_device(self):
         """Load the bridge itself as devices['1'] without requiring AssociatedArea."""

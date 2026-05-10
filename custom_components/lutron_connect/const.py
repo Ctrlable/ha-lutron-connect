@@ -28,7 +28,7 @@ ACTION_RELEASE = "release"
 
 UNASSIGNED_AREA = "Unassigned"
 
-BRIDGE_TIMEOUT = 35
+BRIDGE_TIMEOUT = 120
 
 # Connect Bridge uses port 8090 for LEAP operations.
 LEAP_PORT = 8090
