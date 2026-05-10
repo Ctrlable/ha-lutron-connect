@@ -82,6 +82,9 @@ async def async_setup_entry(
             timed_out = False
     except TimeoutError:
         pass
+    except (OSError, ssl.SSLError) as exc:
+        await bridge.close()
+        raise ConfigEntryNotReady(f"Cannot connect to {host}: {exc}") from exc
 
     if timed_out or not bridge.is_connected():
         await bridge.close()

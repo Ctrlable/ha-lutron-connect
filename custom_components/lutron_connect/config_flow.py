@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 import ssl
@@ -14,19 +13,16 @@ from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_HOST, CONF_NAME
 
 from .const import (
-    BRIDGE_TIMEOUT,
     CONF_CA_CERTS,
     CONF_CERTFILE,
     CONF_KEYFILE,
     DOMAIN,
-    LEAP_PORT,
 )
 from .pairing import PAIR_CA, PAIR_CERT, PAIR_KEY, async_pair
 
 _LOGGER = logging.getLogger(__name__)
 
 TLS_ASSET_TEMPLATE = "lutron_connect-{}-{}.pem"
-ENTRY_DEFAULT_TITLE = "Connect Bridge"
 DATA_SCHEMA_USER = vol.Schema({vol.Required(CONF_HOST): str})
 
 FILE_MAPPING = {
@@ -81,27 +77,28 @@ class LutronConnectFlowHandler(ConfigFlow, domain=DOMAIN):
         self._async_abort_entries_match({CONF_HOST: self.data[CONF_HOST]})
         self._configure_tls_assets()
 
+        # Check once (without a network call) whether valid certs already exist.
         if not self._tls_attempted:
-            if await self.hass.async_add_executor_job(
-                self._tls_assets_exist
-            ) and await self._async_get_bridge_id():
-                self._tls_validated = True
+            self._tls_validated = await self.hass.async_add_executor_job(
+                self._tls_assets_valid
+            )
             self._tls_attempted = True
 
         if user_input is not None:
+            # Certs are already good — skip re-pairing.
             if self._tls_validated:
                 return self.async_create_entry(title=self._bridge_id, data=self.data)
 
             try:
                 assets = await async_pair(self.data[CONF_HOST])
             except (TimeoutError, OSError, RuntimeError) as exc:
-                _LOGGER.error("Pairing failed: %s", exc)
+                _LOGGER.error("Pairing failed for %s: %s", self.data[CONF_HOST], exc)
                 errors["base"] = "cannot_connect"
             else:
+                # async_pair already verified connectivity via ping on port 8090.
+                # Write certs and create the entry; async_setup_entry will connect
+                # and set the unique_id from the bridge serial.
                 await self.hass.async_add_executor_job(self._write_tls_assets, assets)
-                if bridge_id := await self._async_get_bridge_id():
-                    await self.async_set_unique_id(bridge_id, raise_on_progress=False)
-                    self._abort_if_unique_id_configured()
                 return self.async_create_entry(title=self._bridge_id, data=self.data)
 
         return self.async_show_form(
@@ -121,11 +118,22 @@ class LutronConnectFlowHandler(ConfigFlow, domain=DOMAIN):
         for asset_key, conf_key in FILE_MAPPING.items():
             self.data[conf_key] = TLS_ASSET_TEMPLATE.format(self._bridge_id, asset_key)
 
-    def _tls_assets_exist(self) -> bool:
-        return all(
-            os.path.exists(self.hass.config.path(self.data[conf_key]))
-            for conf_key in FILE_MAPPING.values()
-        )
+    def _tls_assets_valid(self) -> bool:
+        """Return True if cert files exist and can be loaded as a valid SSL context."""
+        for conf_key in FILE_MAPPING.values():
+            if not os.path.exists(self.hass.config.path(self.data[conf_key])):
+                return False
+        try:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = False
+            ctx.load_verify_locations(self.hass.config.path(self.data[CONF_CA_CERTS]))
+            ctx.load_cert_chain(
+                self.hass.config.path(self.data[CONF_CERTFILE]),
+                self.hass.config.path(self.data[CONF_KEYFILE]),
+            )
+            return True
+        except ssl.SSLError:
+            return False
 
     def _write_tls_assets(self, assets: dict) -> None:
         for asset_key, conf_key in FILE_MAPPING.items():
@@ -133,36 +141,3 @@ class LutronConnectFlowHandler(ConfigFlow, domain=DOMAIN):
                 self.hass.config.path(self.data[conf_key]), "w", encoding="utf8"
             ) as fh:
                 fh.write(assets[asset_key])
-
-    async def _async_get_bridge_id(self) -> str | None:
-        """Connect to bridge and return its serial-based ID."""
-        from pylutron_caseta.smartbridge import Smartbridge
-
-        try:
-            bridge = Smartbridge.create_tls(
-                hostname=self.data[CONF_HOST],
-                keyfile=self.hass.config.path(self.data[CONF_KEYFILE]),
-                certfile=self.hass.config.path(self.data[CONF_CERTFILE]),
-                ca_certs=self.hass.config.path(self.data[CONF_CA_CERTS]),
-                port=LEAP_PORT,
-            )
-        except ssl.SSLError:
-            return None
-
-        try:
-            async with asyncio.timeout(BRIDGE_TIMEOUT):
-                await bridge.connect()
-        except TimeoutError:
-            _LOGGER.error("Timeout connecting to %s", self.data[CONF_HOST])
-        else:
-            if bridge.is_connected():
-                devices = bridge.get_devices()
-                from .const import BRIDGE_DEVICE_ID
-                bridge_device = devices[BRIDGE_DEVICE_ID]
-                serial = bridge_device.get("serial")
-                if serial is not None:
-                    return hex(int(serial))[2:].zfill(8)
-        finally:
-            await bridge.close()
-
-        return None
