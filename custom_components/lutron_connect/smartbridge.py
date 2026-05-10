@@ -6,20 +6,27 @@ falls into the Caseta branch and crashes on the missing DeviceType key.
 
 The Connect Bridge also does not support per-area LEAP sub-resources
 (/area/{id}/associatedzone, /area/{id}/associatedcontrolstation), returning 405
-for each. Those 405 responses don't include a ClientTag, so pylutron_caseta's
-_request() waits the full REQUEST_TIMEOUT (5 s) per call — with 31 areas that
-adds up to >5 minutes before the bridge_timeout fires.
+for each.
 
 This subclass implements a flat loading strategy:
   - /zone          → all zone definitions (replaces per-area /associatedzone)
   - /device?...    → all keypad devices   (replaces per-area /associatedcontrolstation)
   - /zone/status   → zone state subscription (same as RA3, confirmed working)
+
+Correct command formats confirmed on Connect Bridge firmware 08.01.09f000:
+  - Dimmed zones:   GoToDimmedLevel  + DimmedLevelParameters:  {"Level": 0-100}
+  - Switched zones: GoToSwitchedLevel + SwitchedLevelParameters: {"SwitchedLevel": "On"/"Off"}
+  - Shade zones:    GoToShadeLevel   + ShadeLevelParameters:   {"Level": 0-100}
+  - Raise/Lower/Stop work on all shade zones
+  - GoToLevel returns 405 on all zone types (not supported)
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import timedelta
+from typing import Optional
 
 from pylutron_caseta import BridgeResponseError, _LEAP_DEVICE_TYPES, BUTTON_STATUS_RELEASED
 from pylutron_caseta.leap import id_from_href
@@ -28,6 +35,13 @@ from pylutron_caseta.smartbridge import Smartbridge
 _LOGGER = logging.getLogger(__name__)
 
 _SENSOR_TYPES = set(_LEAP_DEVICE_TYPES.get("sensor", []))
+
+
+def _leap_duration(td: timedelta) -> str:
+    total = int(td.total_seconds())
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
 
 
 class ConnectSmartbridge(Smartbridge):
@@ -70,6 +84,77 @@ class ConnectSmartbridge(Smartbridge):
             if not self._login_completed.done():
                 self._login_completed.set_exception(ex)
             raise
+
+    async def set_value(
+        self,
+        device_id: str,
+        value: Optional[int] = None,
+        fade_time: Optional[timedelta] = None,
+        color_value=None,
+    ) -> None:
+        """Send the correct LEAP command for the Connect Bridge zone type."""
+        device = self.devices.get(device_id)
+        if device is None:
+            return
+
+        zone_type = device.get("type", "")
+        zone_id = device.get("zone")
+
+        if not zone_id or zone_type not in ("Dimmed", "Switched", "Shade"):
+            return await super().set_value(device_id, value, fade_time, color_value)
+
+        if zone_type == "Dimmed":
+            params: dict = {"Level": value if value is not None else 0}
+            if fade_time is not None:
+                params["FadeTime"] = _leap_duration(fade_time)
+            await self._request(
+                "CreateRequest",
+                f"/zone/{zone_id}/commandprocessor",
+                {"Command": {"CommandType": "GoToDimmedLevel", "DimmedLevelParameters": params}},
+            )
+
+        elif zone_type == "Switched":
+            await self._request(
+                "CreateRequest",
+                f"/zone/{zone_id}/commandprocessor",
+                {
+                    "Command": {
+                        "CommandType": "GoToSwitchedLevel",
+                        "SwitchedLevelParameters": {
+                            "SwitchedLevel": "On" if value and value > 0 else "Off"
+                        },
+                    }
+                },
+            )
+
+        elif zone_type == "Shade":
+            level = value if value is not None else 0
+            await self._request(
+                "CreateRequest",
+                f"/zone/{zone_id}/commandprocessor",
+                {"Command": {"CommandType": "GoToShadeLevel", "ShadeLevelParameters": {"Level": level}}},
+            )
+            self.devices[device_id]["current_state"] = level
+            if device_id in self._subscribers:
+                self._subscribers[device_id]()
+
+    async def raise_cover(self, device_id: str) -> None:
+        """Raise a shade and notify subscribers of the optimistic state."""
+        await super().raise_cover(device_id)
+        if device_id in self._subscribers:
+            self._subscribers[device_id]()
+
+    async def lower_cover(self, device_id: str) -> None:
+        """Lower a shade and notify subscribers of the optimistic state."""
+        await super().lower_cover(device_id)
+        if device_id in self._subscribers:
+            self._subscribers[device_id]()
+
+    def _handle_zone_status(self, status: dict) -> None:
+        """Translate SwitchedLevel into a numeric Level before delegating."""
+        if "SwitchedLevel" in status and "Level" not in status:
+            status = {**status, "Level": 100 if status["SwitchedLevel"] == "On" else 0}
+        super()._handle_zone_status(status)
 
     async def _load_connect_bridge_device(self):
         """Load the bridge itself as devices['1'] without requiring AssociatedArea."""

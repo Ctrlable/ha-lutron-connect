@@ -62,10 +62,10 @@ class LutronConnectCover(LutronConnectDevice, CoverEntity):
         return self._attr_current_cover_position == 0
 
     async def async_open_cover(self, **kwargs: Any) -> None:
-        await self._bridge.set_value(self.device_id, 100)
+        await self._bridge.raise_cover(self.device_id)
 
     async def async_close_cover(self, **kwargs: Any) -> None:
-        await self._bridge.set_value(self.device_id, 0)
+        await self._bridge.lower_cover(self.device_id)
 
     async def async_set_cover_position(self, **kwargs: Any) -> None:
         await self._bridge.set_value(self.device_id, int(kwargs[ATTR_POSITION]))

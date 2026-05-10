@@ -87,7 +87,8 @@ class LutronConnectLight(LutronConnectDevice, LightEntity):
         self._attr_brightness = hass_level
         if self._prev_brightness is None or hass_level != 0:
             self._prev_brightness = hass_level
-        self.async_write_ha_state()
+        if self.entity_id:
+            self.async_write_ha_state()
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         if ATTR_BRIGHTNESS in kwargs and self._dimmable:
