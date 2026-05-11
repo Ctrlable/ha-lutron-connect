@@ -8,6 +8,7 @@ from typing import Any
 
 from homeassistant.components.light import (
     ATTR_BRIGHTNESS,
+    ATTR_COLOR_TEMP_KELVIN,
     ATTR_TRANSITION,
     ColorMode,
     LightEntity,
@@ -25,8 +26,9 @@ _LOGGER = logging.getLogger(__name__)
 _DIMMABLE_TYPES = frozenset({
     "WallDimmer", "PlugInDimmer", "InLineDimmer", "SunnataDimmer",
     "TempInWallPaddleDimmer", "WallDimmerWithPreset", "Dimmed",
-    "SpectrumTune", "DivaSmartDimmer", "WhiteTune", "PowPak0-10V", "ColorTune",
+    "DivaSmartDimmer", "PowPak0-10V",
 })
+_COLOR_TUNING_TYPES = frozenset({"SpectrumTune", "WhiteTune", "ColorTune"})
 _SWITCHED_LIGHT_TYPES = frozenset({"Switched"})
 
 
@@ -41,7 +43,9 @@ async def async_setup_entry(
     entities = []
     for device in bridge.get_devices().values():
         device_type = device.get("type", "")
-        if device_type in _DIMMABLE_TYPES:
+        if device_type in _COLOR_TUNING_TYPES:
+            entities.append(LutronConnectColorLight(device, data))
+        elif device_type in _DIMMABLE_TYPES:
             entities.append(LutronConnectLight(device, data, dimmable=True))
         elif device_type in _SWITCHED_LIGHT_TYPES:
             entities.append(LutronConnectLight(device, data, dimmable=False))
@@ -110,3 +114,45 @@ class LutronConnectLight(LutronConnectDevice, LightEntity):
 
     async def async_update(self) -> None:
         self._on_level_update()
+
+
+class LutronConnectColorLight(LutronConnectLight):
+    """A Ketra/SpectrumTune zone with color temperature (CCT) support."""
+
+    def __init__(self, device: dict[str, Any], data: LutronConnectData) -> None:
+        super().__init__(device, data, dimmable=True)
+        white_range = (device.get("white_tuning_range") or {})
+        self._attr_min_color_temp_kelvin = int(white_range.get("MinColorTemp", 1400))
+        self._attr_max_color_temp_kelvin = int(white_range.get("MaxColorTemp", 6500))
+        self._attr_color_mode = ColorMode.COLOR_TEMP
+        self._attr_supported_color_modes = {ColorMode.COLOR_TEMP}
+
+    def _on_level_update(self, _=None) -> None:
+        device = self._bridge.get_device_by_id(self.device_id)
+        level = device.get("current_state", -1)
+        if level < 0:
+            return
+        self._attr_is_on = level > 0
+        hass_level = _to_hass(level)
+        self._attr_brightness = hass_level
+        if self._prev_brightness is None or hass_level != 0:
+            self._prev_brightness = hass_level
+        color_temp_k = device.get("current_color_temp")
+        if color_temp_k and color_temp_k > 0:
+            self._attr_color_temp_kelvin = int(color_temp_k)
+        if self.entity_id:
+            self.async_write_ha_state()
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        brightness = kwargs.get(ATTR_BRIGHTNESS, self._prev_brightness or 255)
+        self._prev_brightness = brightness
+        level = int(_to_lutron(brightness))
+        fade_secs = kwargs.get(ATTR_TRANSITION)
+        fade = timedelta(seconds=fade_secs) if fade_secs is not None else None
+
+        color_value = None
+        color_temp_k = kwargs.get(ATTR_COLOR_TEMP_KELVIN)
+        if color_temp_k:
+            color_value = {"color_temp": int(color_temp_k)}
+
+        await self._bridge.set_value(self.device_id, level, fade_time=fade, color_value=color_value)

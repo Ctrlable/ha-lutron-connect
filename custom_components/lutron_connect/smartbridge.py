@@ -132,7 +132,8 @@ class ConnectSmartbridge(Smartbridge):
         zone_type = device.get("type", "")
         zone_id = device.get("zone")
 
-        if not zone_id or zone_type not in ("Dimmed", "Switched", "Shade"):
+        _HANDLED = {"Dimmed", "Switched", "Shade", "SpectrumTune", "WhiteTune", "ColorTune"}
+        if not zone_id or zone_type not in _HANDLED:
             return await super().set_value(device_id, value, fade_time, color_value)
 
         if zone_type == "Dimmed":
@@ -170,6 +171,31 @@ class ConnectSmartbridge(Smartbridge):
             if device_id in self._subscribers:
                 self._subscribers[device_id]()
 
+        elif zone_type in ("SpectrumTune", "WhiteTune", "ColorTune"):
+            params: dict = {}
+            if value is not None:
+                params["Level"] = value
+            if fade_time is not None:
+                params["FadeTime"] = _leap_duration(fade_time)
+            if color_value and "color_temp" in color_value:
+                params["ColorTemperature"] = color_value["color_temp"]
+                self.devices[device_id]["current_color_temp"] = color_value["color_temp"]
+            elif color_value and "xy" in color_value:
+                x, y = color_value["xy"]
+                params["ColorAmbiance"] = {"Whitepoint": {"X": x, "Y": y}}
+            await self._request(
+                "CreateRequest",
+                f"/zone/{zone_id}/commandprocessor",
+                {"Command": {
+                    "CommandType": "GoToSpectrumTuningLevel",
+                    "SpectrumTuningLevelParameters": params,
+                }},
+            )
+            if value is not None:
+                self.devices[device_id]["current_state"] = value
+            if device_id in self._subscribers:
+                self._subscribers[device_id]()
+
     async def raise_cover(self, device_id: str) -> None:
         """Raise a shade and notify subscribers of the optimistic state."""
         await super().raise_cover(device_id)
@@ -196,9 +222,23 @@ class ConnectSmartbridge(Smartbridge):
             _LOGGER.warning("tap_button %s failed: %s", button_id, exc)
 
     def _handle_zone_status(self, status: dict) -> None:
-        """Translate SwitchedLevel into a numeric Level before delegating."""
+        """Translate SwitchedLevel into a numeric Level and cache color tuning state."""
         if "SwitchedLevel" in status and "Level" not in status:
             status = {**status, "Level": 100 if status["SwitchedLevel"] == "On" else 0}
+
+        color_tuning = status.get("ColorTuningStatus")
+        if color_tuning:
+            zone_href = (status.get("Zone") or {}).get("href", "")
+            zone_id = id_from_href(zone_href) if zone_href else None
+            if zone_id and zone_id in self.devices:
+                ct_k = status.get("ColorTemperature")
+                if ct_k:
+                    self.devices[zone_id]["current_color_temp"] = ct_k
+                xy = color_tuning.get("XYTuningLevel") or {}
+                x, y = xy.get("X", 0), xy.get("Y", 0)
+                if x > 0 and y > 0:
+                    self.devices[zone_id]["current_xy"] = (x, y)
+
         super()._handle_zone_status(status)
 
     async def _load_connect_bridge_device(self):
