@@ -19,6 +19,11 @@ Correct command formats confirmed on Connect Bridge firmware 08.01.09f000:
   - Shade zones:    GoToShadeLevel   + ShadeLevelParameters:   {"Level": 0-100}
   - Raise/Lower/Stop work on all shade zones
   - GoToLevel returns 405 on all zone types (not supported)
+  - SpectrumTune/ColorTune: GoToSpectrumTuningLevel + SpectrumTuningLevelParameters
+      Color must be nested under ColorTuningStatus (mirrors status format):
+        CCT:  {"Level": N, "ColorTuningStatus": {"WhiteTuningLevel": {"Kelvin": K}}}
+        HSV:  {"Level": N, "ColorTuningStatus": {"HSVTuningLevel": {"Hue": H, "Saturation": S}}}
+      Flat ColorTemperature / bare HSVTuningLevel / Vibrancy params are silently ignored.
 
 Button cluster detection:
   On HWQS systems consecutive buttons within the same physical keypad have LEAP IDs
@@ -33,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections import defaultdict
 from datetime import timedelta
 from typing import Callable, Optional
@@ -179,19 +185,20 @@ class ConnectSmartbridge(Smartbridge):
                 params["FadeTime"] = _leap_duration(fade_time)
             if color_value and "hs" in color_value:
                 h, s = color_value["hs"]
-                params["HSVTuningLevel"] = {"Hue": round(h), "Saturation": round(s)}
+                params["ColorTuningStatus"] = {"HSVTuningLevel": {"Hue": round(h), "Saturation": round(s)}}
                 self.devices[device_id]["current_hs_color"] = (h, s)
                 self.devices[device_id]["current_color_mode"] = "hs"
-                self.devices[device_id]["color_command_time"] = asyncio.get_event_loop().time()
             elif color_value and "color_temp" in color_value:
-                params["ColorTemperature"] = color_value["color_temp"]
+                params["ColorTuningStatus"] = {"WhiteTuningLevel": {"Kelvin": color_value["color_temp"]}}
                 self.devices[device_id]["current_color_temp"] = color_value["color_temp"]
                 self.devices[device_id]["current_color_mode"] = "color_temp"
-                self.devices[device_id]["color_command_time"] = asyncio.get_event_loop().time()
             elif color_value and "xy" in color_value:
                 x, y = color_value["xy"]
-                params["XYTuningLevel"] = {"X": x, "Y": y}
-                self.devices[device_id]["color_command_time"] = asyncio.get_event_loop().time()
+                params["ColorTuningStatus"] = {"XYTuningLevel": {"X": x, "Y": y}}
+            # Record time before the await so the echo-lockout in _handle_zone_status
+            # is already armed when the bridge's ~60ms echo arrives.
+            if color_value:
+                self.devices[device_id]["color_command_time"] = time.monotonic()
             await self._request(
                 "CreateRequest",
                 f"/zone/{zone_id}/commandprocessor",
@@ -240,23 +247,34 @@ class ConnectSmartbridge(Smartbridge):
             zone_href = (status.get("Zone") or {}).get("href", "")
             zone_id = id_from_href(zone_href) if zone_href else None
             if zone_id and zone_id in self.devices:
-                # After we send a color command, the bridge echoes back the Lutron app's
-                # last-known state (the old color) as a subscription push.  Guard against
-                # that echo overwriting our optimistic state for 3 seconds.
-                cmd_time = self.devices[zone_id].get("color_command_time", 0)
-                if asyncio.get_event_loop().time() - cmd_time >= 3.0:
-                    ct_k = status.get("ColorTemperature")
-                    if ct_k:
-                        self.devices[zone_id]["current_color_temp"] = ct_k
-                    hsv = color_tuning.get("HSVTuningLevel") or {}
-                    h, s = hsv.get("Hue", 0), hsv.get("Saturation", 0)
-                    if s > 0:
-                        self.devices[zone_id]["current_hs_color"] = (h, s)
-                        self.devices[zone_id]["current_color_mode"] = "hs"
-                    xy = color_tuning.get("XYTuningLevel") or {}
-                    x, y = xy.get("X", 0), xy.get("Y", 0)
-                    if x > 0 and y > 0:
-                        self.devices[zone_id]["current_xy"] = (x, y)
+                # After we send a color command the bridge echoes back stale
+                # ColorTuningStatus (~60 ms later).  Ignore it for 2 seconds.
+                cmd_time = self.devices[zone_id].get("color_command_time", -100)
+                if time.monotonic() - cmd_time >= 2.0:
+                    white_tuning = color_tuning.get("WhiteTuningLevel")
+                    hsv_tuning = color_tuning.get("HSVTuningLevel")
+                    vibrancy = status.get("Vibrancy", -1)
+
+                    if vibrancy > 0 and hsv_tuning:
+                        # Lutron app color mode: high Vibrancy, both CCT and HSV present
+                        h = hsv_tuning.get("Hue", 0)
+                        s = hsv_tuning.get("Saturation", 0)
+                        if s > 0:
+                            self.devices[zone_id]["current_hs_color"] = (h, s)
+                            self.devices[zone_id]["current_color_mode"] = "hs"
+                    elif hsv_tuning and not white_tuning:
+                        # LEAP ColorTuningStatus HSV mode: only HSVTuningLevel present
+                        h = hsv_tuning.get("Hue", 0)
+                        s = hsv_tuning.get("Saturation", 0)
+                        if s > 0:
+                            self.devices[zone_id]["current_hs_color"] = (h, s)
+                            self.devices[zone_id]["current_color_mode"] = "hs"
+                    elif white_tuning:
+                        # CCT mode: WhiteTuningLevel present (computed HSV may also be present)
+                        ct_k = white_tuning.get("Kelvin")
+                        if ct_k:
+                            self.devices[zone_id]["current_color_temp"] = ct_k
+                            self.devices[zone_id]["current_color_mode"] = "color_temp"
 
         super()._handle_zone_status(status)
 
