@@ -177,12 +177,18 @@ class ConnectSmartbridge(Smartbridge):
                 params["Level"] = value
             if fade_time is not None:
                 params["FadeTime"] = _leap_duration(fade_time)
-            if color_value and "color_temp" in color_value:
+            if color_value and "hs" in color_value:
+                h, s = color_value["hs"]
+                params["HSVTuningLevel"] = {"Hue": round(h), "Saturation": round(s)}
+                self.devices[device_id]["current_hs_color"] = (h, s)
+                self.devices[device_id]["current_color_mode"] = "hs"
+            elif color_value and "color_temp" in color_value:
                 params["ColorTemperature"] = color_value["color_temp"]
                 self.devices[device_id]["current_color_temp"] = color_value["color_temp"]
+                self.devices[device_id]["current_color_mode"] = "color_temp"
             elif color_value and "xy" in color_value:
                 x, y = color_value["xy"]
-                params["ColorAmbiance"] = {"Whitepoint": {"X": x, "Y": y}}
+                params["XYTuningLevel"] = {"X": x, "Y": y}
             await self._request(
                 "CreateRequest",
                 f"/zone/{zone_id}/commandprocessor",
@@ -234,6 +240,11 @@ class ConnectSmartbridge(Smartbridge):
                 ct_k = status.get("ColorTemperature")
                 if ct_k:
                     self.devices[zone_id]["current_color_temp"] = ct_k
+                hsv = color_tuning.get("HSVTuningLevel") or {}
+                h, s = hsv.get("Hue", 0), hsv.get("Saturation", 0)
+                if s > 0:
+                    self.devices[zone_id]["current_hs_color"] = (h, s)
+                    self.devices[zone_id]["current_color_mode"] = "hs"
                 xy = color_tuning.get("XYTuningLevel") or {}
                 x, y = xy.get("X", 0), xy.get("Y", 0)
                 if x > 0 and y > 0:

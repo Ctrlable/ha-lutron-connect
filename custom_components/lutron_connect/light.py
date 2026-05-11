@@ -9,6 +9,7 @@ from typing import Any
 from homeassistant.components.light import (
     ATTR_BRIGHTNESS,
     ATTR_COLOR_TEMP_KELVIN,
+    ATTR_HS_COLOR,
     ATTR_TRANSITION,
     ColorMode,
     LightEntity,
@@ -125,7 +126,7 @@ class LutronConnectColorLight(LutronConnectLight):
         self._attr_min_color_temp_kelvin = int(white_range.get("MinColorTemp", 1400))
         self._attr_max_color_temp_kelvin = int(white_range.get("MaxColorTemp", 6500))
         self._attr_color_mode = ColorMode.COLOR_TEMP
-        self._attr_supported_color_modes = {ColorMode.COLOR_TEMP}
+        self._attr_supported_color_modes = {ColorMode.COLOR_TEMP, ColorMode.HS}
 
     def _on_level_update(self, _=None) -> None:
         device = self._bridge.get_device_by_id(self.device_id)
@@ -137,9 +138,17 @@ class LutronConnectColorLight(LutronConnectLight):
         self._attr_brightness = hass_level
         if self._prev_brightness is None or hass_level != 0:
             self._prev_brightness = hass_level
-        color_temp_k = device.get("current_color_temp")
-        if color_temp_k and color_temp_k > 0:
-            self._attr_color_temp_kelvin = int(color_temp_k)
+        color_mode = device.get("current_color_mode", "color_temp")
+        if color_mode == "hs":
+            hs = device.get("current_hs_color")
+            if hs:
+                self._attr_hs_color = hs
+            self._attr_color_mode = ColorMode.HS
+        else:
+            ct_k = device.get("current_color_temp")
+            if ct_k and ct_k > 0:
+                self._attr_color_temp_kelvin = int(ct_k)
+            self._attr_color_mode = ColorMode.COLOR_TEMP
         if self.entity_id:
             self.async_write_ha_state()
 
@@ -151,8 +160,9 @@ class LutronConnectColorLight(LutronConnectLight):
         fade = timedelta(seconds=fade_secs) if fade_secs is not None else None
 
         color_value = None
-        color_temp_k = kwargs.get(ATTR_COLOR_TEMP_KELVIN)
-        if color_temp_k:
-            color_value = {"color_temp": int(color_temp_k)}
+        if ATTR_HS_COLOR in kwargs:
+            color_value = {"hs": kwargs[ATTR_HS_COLOR]}
+        elif ATTR_COLOR_TEMP_KELVIN in kwargs:
+            color_value = {"color_temp": int(kwargs[ATTR_COLOR_TEMP_KELVIN])}
 
         await self._bridge.set_value(self.device_id, level, fade_time=fade, color_value=color_value)
