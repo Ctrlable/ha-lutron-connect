@@ -182,13 +182,16 @@ class ConnectSmartbridge(Smartbridge):
                 params["HSVTuningLevel"] = {"Hue": round(h), "Saturation": round(s)}
                 self.devices[device_id]["current_hs_color"] = (h, s)
                 self.devices[device_id]["current_color_mode"] = "hs"
+                self.devices[device_id]["color_command_time"] = asyncio.get_event_loop().time()
             elif color_value and "color_temp" in color_value:
                 params["ColorTemperature"] = color_value["color_temp"]
                 self.devices[device_id]["current_color_temp"] = color_value["color_temp"]
                 self.devices[device_id]["current_color_mode"] = "color_temp"
+                self.devices[device_id]["color_command_time"] = asyncio.get_event_loop().time()
             elif color_value and "xy" in color_value:
                 x, y = color_value["xy"]
                 params["XYTuningLevel"] = {"X": x, "Y": y}
+                self.devices[device_id]["color_command_time"] = asyncio.get_event_loop().time()
             await self._request(
                 "CreateRequest",
                 f"/zone/{zone_id}/commandprocessor",
@@ -237,18 +240,23 @@ class ConnectSmartbridge(Smartbridge):
             zone_href = (status.get("Zone") or {}).get("href", "")
             zone_id = id_from_href(zone_href) if zone_href else None
             if zone_id and zone_id in self.devices:
-                ct_k = status.get("ColorTemperature")
-                if ct_k:
-                    self.devices[zone_id]["current_color_temp"] = ct_k
-                hsv = color_tuning.get("HSVTuningLevel") or {}
-                h, s = hsv.get("Hue", 0), hsv.get("Saturation", 0)
-                if s > 0:
-                    self.devices[zone_id]["current_hs_color"] = (h, s)
-                    self.devices[zone_id]["current_color_mode"] = "hs"
-                xy = color_tuning.get("XYTuningLevel") or {}
-                x, y = xy.get("X", 0), xy.get("Y", 0)
-                if x > 0 and y > 0:
-                    self.devices[zone_id]["current_xy"] = (x, y)
+                # After we send a color command, the bridge echoes back the Lutron app's
+                # last-known state (the old color) as a subscription push.  Guard against
+                # that echo overwriting our optimistic state for 3 seconds.
+                cmd_time = self.devices[zone_id].get("color_command_time", 0)
+                if asyncio.get_event_loop().time() - cmd_time >= 3.0:
+                    ct_k = status.get("ColorTemperature")
+                    if ct_k:
+                        self.devices[zone_id]["current_color_temp"] = ct_k
+                    hsv = color_tuning.get("HSVTuningLevel") or {}
+                    h, s = hsv.get("Hue", 0), hsv.get("Saturation", 0)
+                    if s > 0:
+                        self.devices[zone_id]["current_hs_color"] = (h, s)
+                        self.devices[zone_id]["current_color_mode"] = "hs"
+                    xy = color_tuning.get("XYTuningLevel") or {}
+                    x, y = xy.get("X", 0), xy.get("Y", 0)
+                    if x > 0 and y > 0:
+                        self.devices[zone_id]["current_xy"] = (x, y)
 
         super()._handle_zone_status(status)
 
