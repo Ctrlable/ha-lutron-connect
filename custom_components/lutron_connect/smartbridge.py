@@ -195,10 +195,10 @@ class ConnectSmartbridge(Smartbridge):
             elif color_value and "xy" in color_value:
                 x, y = color_value["xy"]
                 params["ColorTuningStatus"] = {"XYTuningLevel": {"X": x, "Y": y}}
-            # Record time before the await so the echo-lockout in _handle_zone_status
-            # is already armed when the bridge's ~60ms echo arrives.
-            if color_value:
-                self.devices[device_id]["color_command_time"] = time.monotonic()
+            # Arm echo-lockout before the await for ALL SpectrumTune commands.
+            # The bridge echoes a stale Lutron-app ColorTuningStatus ~60 ms after
+            # any GoToSpectrumTuningLevel, not just color commands.
+            self.devices[device_id]["color_command_time"] = time.monotonic()
             await self._request(
                 "CreateRequest",
                 f"/zone/{zone_id}/commandprocessor",
