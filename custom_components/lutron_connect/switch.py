@@ -13,7 +13,7 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from . import DOMAIN, LutronConnectData, _area_name, _serial_to_unique_id
-from .const import CONFIG_URL, MANUFACTURER, UNASSIGNED_AREA
+from .const import CONFIG_URL, MANUFACTURER, UNASSIGNED_AREA, link_to_bridge
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -67,11 +67,15 @@ class LutronConnectKeypadLED(SwitchEntity):
                 manufacturer=MANUFACTURER,
                 name=f"{area} {keypad_name}",
                 model=f"{parent_keypad['model']} ({parent_keypad['type']})",
-                via_device=(DOMAIN, data.bridge_device["serial"]),
                 configuration_url=CONFIG_URL,
             )
             if area != UNASSIGNED_AREA:
                 info["suggested_area"] = area
+            link_to_bridge(
+                info,
+                data.bridge_device["serial"],
+                getattr(data, "bridge_ha_device_id", None),
+            )
             self._attr_device_info = info
         else:
             self._attr_name = device.get("name", f"LED {device['device_id']}")

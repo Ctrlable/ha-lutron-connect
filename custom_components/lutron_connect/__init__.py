@@ -40,6 +40,7 @@ from .const import (
     LUTRON_CASETA_BUTTON_EVENT,
     MANUFACTURER,
     UNASSIGNED_AREA,
+    link_to_bridge,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -105,12 +106,17 @@ async def async_setup_entry(
             config_entry, unique_id=_serial_to_unique_id(bridge_device["serial"])
         )
 
-    _async_register_bridge_device(hass, entry_id, bridge_device, bridge)
-    keypad_data = _async_setup_keypads(hass, entry_id, bridge, bridge_device)
+    bridge_ha_device_id = _async_register_bridge_device(
+        hass, entry_id, bridge_device, bridge
+    )
+    keypad_data = _async_setup_keypads(
+        hass, entry_id, bridge, bridge_device, bridge_ha_device_id
+    )
 
     hass.data.setdefault(DOMAIN, {})[entry_id] = LutronConnectData(
         bridge=bridge,
         bridge_device=bridge_device,
+        bridge_ha_device_id=bridge_ha_device_id,
         keypads=keypad_data["keypads"],
         keypad_buttons=keypad_data["keypad_buttons"],
     )
@@ -133,9 +139,12 @@ async def async_unload_entry(
 class LutronConnectData:
     """Runtime data stored per config entry."""
 
-    def __init__(self, bridge, bridge_device, keypads, keypad_buttons):
+    def __init__(self, bridge, bridge_device, keypads, keypad_buttons,
+                 bridge_ha_device_id=None):
         self.bridge: Smartbridge = bridge
         self.bridge_device: dict[str, Any] = bridge_device
+        # Registry id of the bridge's HA device — entities parent to it.
+        self.bridge_ha_device_id: str | None = bridge_ha_device_id
         self.keypads: dict[int, dict] = keypads
         self.keypad_buttons: dict[int, dict] = keypad_buttons
 
@@ -146,7 +155,7 @@ def _async_register_bridge_device(
     config_entry_id: str,
     bridge_device: dict,
     bridge: Smartbridge,
-) -> None:
+) -> str:
     device_registry = dr.async_get(hass)
     area = _area_name(bridge.areas, bridge_device.get("area"))
     info = DeviceInfo(
@@ -158,7 +167,9 @@ def _async_register_bridge_device(
     )
     if area != UNASSIGNED_AREA:
         info[ATTR_SUGGESTED_AREA] = area
-    device_registry.async_get_or_create(**info, config_entry_id=config_entry_id)
+    return device_registry.async_get_or_create(
+        **info, config_entry_id=config_entry_id
+    ).id
 
 
 @callback
@@ -167,6 +178,7 @@ def _async_setup_keypads(
     config_entry_id: str,
     bridge: Smartbridge,
     bridge_device: dict,
+    bridge_ha_device_id: str | None = None,
 ) -> dict:
     device_registry = dr.async_get(hass)
     bridge_devices = bridge.get_devices()
@@ -191,8 +203,8 @@ def _async_setup_keypads(
                 manufacturer=MANUFACTURER,
                 identifiers={(DOMAIN, serial)},
                 model=f"{bridge_keypad['model']} ({bridge_keypad['type']})",
-                via_device=(DOMAIN, bridge_device["serial"]),
             )
+            link_to_bridge(info, bridge_device["serial"], bridge_ha_device_id)
             if area_name != UNASSIGNED_AREA:
                 info[ATTR_SUGGESTED_AREA] = area_name
 
@@ -301,6 +313,7 @@ class LutronConnectDevice:
         self._bridge = data.bridge
         self._bridge_device = data.bridge_device
         self._bridge_unique_id = _serial_to_unique_id(data.bridge_device["serial"])
+        self._bridge_ha_device_id = getattr(data, "bridge_ha_device_id", None)
 
         if "serial" not in device or "parent_device" in device:
             return
@@ -314,9 +327,9 @@ class LutronConnectDevice:
             manufacturer=MANUFACTURER,
             model=f"{device['model']} ({device['type']})",
             name=full_name,
-            via_device=(DOMAIN, self._bridge_device["serial"]),
             configuration_url=CONFIG_URL,
         )
+        link_to_bridge(info, self._bridge_device["serial"], self._bridge_ha_device_id)
         if area != UNASSIGNED_AREA:
             info[ATTR_SUGGESTED_AREA] = area
         self._attr_device_info = info
