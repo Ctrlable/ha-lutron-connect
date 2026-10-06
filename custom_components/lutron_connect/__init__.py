@@ -12,6 +12,7 @@ from pylutron_caseta import BUTTON_STATUS_PRESSED
 from .smartbridge import ConnectSmartbridge
 
 from homeassistant import config_entries
+from homeassistant.config_entries import SOURCE_IMPORT
 from homeassistant.const import (
     ATTR_DEVICE_ID,
     ATTR_SUGGESTED_AREA,
@@ -20,6 +21,7 @@ from homeassistant.const import (
     Platform,
 )
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.loader import IntegrationNotFound, async_get_integration
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import device_registry as dr, issue_registry as ir
 from homeassistant.helpers.device_registry import DeviceInfo
@@ -133,11 +135,7 @@ async def async_setup_entry(
     # Ketra fixtures get a Vibrancy slider (number platform); the card, tile
     # feature and light-dialog control are the free Ctrlable Vibrancy Card.
     if any(d.get("type") == "SpectrumTune" for d in bridge.get_devices().values()):
-        if hass.is_running:
-            _async_check_vibrancy_card(hass)
-        else:
-            config_entry.async_on_unload(hass.bus.async_listen_once(
-                EVENT_HOMEASSISTANT_STARTED, lambda _e: _async_check_vibrancy_card(hass)))
+        _async_check_card_later(hass)
     return True
 
 
@@ -146,16 +144,37 @@ _CARD_ISSUE = "install_vibrancy_card"
 
 
 @callback
-def _async_check_vibrancy_card(hass: HomeAssistant) -> None:
+def _async_check_card_later(hass: HomeAssistant) -> None:
+    """Run the card check once HA is up (event-loop safe)."""
+    if hass.is_running:
+        hass.async_create_task(_async_check_card(hass))
+        return
+
+    @callback
+    def _on_started(_event) -> None:
+        hass.async_create_task(_async_check_card(hass))
+
+    hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _on_started)
+
+
+async def _async_check_card(hass: HomeAssistant) -> None:
+    """Card set up -> clear the notice; installed only -> set it up; absent -> notice."""
     if hass.config_entries.async_entries(_CARD_DOMAIN):
         ir.async_delete_issue(hass, DOMAIN, _CARD_ISSUE)
         return
-    ir.async_create_issue(
-        hass, DOMAIN, _CARD_ISSUE,
-        is_fixable=False,
-        severity=ir.IssueSeverity.WARNING,
-        translation_key=_CARD_ISSUE,
-        learn_more_url="https://portal.ctrlable.com/docs/vibrancy-card",
+    try:
+        await async_get_integration(hass, _CARD_DOMAIN)
+    except IntegrationNotFound:
+        ir.async_create_issue(
+            hass, DOMAIN, _CARD_ISSUE,
+            is_fixable=False,
+            severity=ir.IssueSeverity.WARNING,
+            translation_key=_CARD_ISSUE,
+            learn_more_url="https://portal.ctrlable.com/docs/vibrancy-card",
+        )
+        return
+    await hass.config_entries.flow.async_init(
+        _CARD_DOMAIN, context={"source": SOURCE_IMPORT}, data={}
     )
 
 
