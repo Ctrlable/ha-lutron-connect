@@ -51,6 +51,7 @@ PLATFORMS = [
     Platform.COVER,
     Platform.FAN,
     Platform.LIGHT,
+    Platform.NUMBER,
     Platform.SCENE,
     Platform.SWITCH,
 ]

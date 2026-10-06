@@ -195,6 +195,13 @@ class ConnectSmartbridge(Smartbridge):
             elif color_value and "xy" in color_value:
                 x, y = color_value["xy"]
                 params["ColorTuningStatus"] = {"XYTuningLevel": {"X": x, "Y": y}}
+            pending = device.get("pending_vibrancy")
+            if pending is not None and value:
+                params["Vibrancy"] = pending
+                if "ColorTuningStatus" not in params:
+                    params.update(self._current_color_params(device))
+                device.pop("pending_vibrancy", None)
+                device["vibrancy_command_time"] = time.monotonic()
             # Arm echo-lockout before the await for ALL SpectrumTune commands.
             # The bridge echoes a stale Lutron-app ColorTuningStatus ~60 ms after
             # any GoToSpectrumTuningLevel, not just color commands.
@@ -277,6 +284,98 @@ class ConnectSmartbridge(Smartbridge):
                             self.devices[zone_id]["current_color_mode"] = "color_temp"
 
         super()._handle_zone_status(status)
+        self._store_vibrancy(status)
+
+    # ------------------------------------------------------------------ Vibrancy
+    #
+    # Verified on CONNECT-BDG2 (Miami showroom, 2026-10-06): zone status carries a
+    # top-level "Vibrancy" (0-100) for Ketra SpectrumTune zones, and it is set with
+    # GoToSpectrumTuningLevel. Unlike QSX, a Vibrancy-ONLY command makes the bridge
+    # fade the fixture to its default white -- Level and the current colour
+    # (ColorTuningStatus) must be sent along with it, and then the colour holds.
+
+    def _vibrancy_subscribers(self) -> dict[str, Callable]:
+        # Not reset by _login(): entities subscribe once and must survive reconnects.
+        return self.__dict__.setdefault("_vib_subs", {})
+
+    def add_vibrancy_subscriber(self, device_id: str, callback_: Callable) -> None:
+        """Register the Vibrancy entity's update callback (separate from add_subscriber,
+        which allows one callback per device and is taken by the light)."""
+        self._vibrancy_subscribers()[device_id] = callback_
+
+    def _notify_vibrancy(self, device_id: str) -> None:
+        if cb := self._vibrancy_subscribers().get(device_id):
+            cb()
+
+    def _store_vibrancy(self, status: dict) -> None:
+        if "Vibrancy" not in status:
+            return
+        zone_href = (status.get("Zone") or {}).get("href", "")
+        zone_id = id_from_href(zone_href) if zone_href else None
+        device = self.devices.get(zone_id) if zone_id else None
+        if device is None:
+            return
+        # Same stale-echo window as colour: ignore pushes right after our command.
+        if time.monotonic() - device.get("vibrancy_command_time", -100) < 2.0:
+            return
+        value = int(status["Vibrancy"])
+        if device.get("vibrancy") != value:
+            device["vibrancy"] = value
+            self._notify_vibrancy(zone_id)
+
+    async def async_read_vibrancy(self) -> None:
+        """Seed Vibrancy for SpectrumTune zones (no bulk /zone/status on Connect)."""
+        for device_id, device in list(self.devices.items()):
+            if device.get("type") != "SpectrumTune" or not device.get("zone"):
+                continue
+            try:
+                resp = await self._request("ReadRequest", f"/zone/{device['zone']}/status")
+            except BridgeResponseError as exc:
+                _LOGGER.debug("Vibrancy read for zone %s failed: %s", device["zone"], exc)
+                continue
+            status = (resp.Body or {}).get("ZoneStatus") or {}
+            if "Vibrancy" in status:
+                device["vibrancy"] = int(status["Vibrancy"])
+                self._notify_vibrancy(device_id)
+
+    def _current_color_params(self, device: dict) -> dict:
+        """ColorTuningStatus for the zone's current colour (empty if unknown)."""
+        if device.get("current_color_mode") == "hs" and device.get("current_hs_color"):
+            h, s = device["current_hs_color"]
+            return {"ColorTuningStatus": {"HSVTuningLevel": {"Hue": round(h), "Saturation": round(s)}}}
+        if device.get("current_color_temp"):
+            return {"ColorTuningStatus": {"WhiteTuningLevel": {"Kelvin": int(device["current_color_temp"])}}}
+        return {}
+
+    async def set_vibrancy(self, device_id: str, vibrancy: int) -> None:
+        """Set Vibrancy (0-100) without changing brightness or colour.
+
+        While the zone is off the value is held and sent with the next turn-on
+        (sending it now would need a Level, i.e. switch the light on).
+        """
+        device = self.devices.get(device_id)
+        if device is None or not device.get("zone"):
+            return
+        vibrancy = max(0, min(100, int(vibrancy)))
+        device["vibrancy"] = vibrancy
+        level = device.get("current_state", -1)
+        if level is None or level <= 0:
+            device["pending_vibrancy"] = vibrancy
+            self._notify_vibrancy(device_id)
+            return
+        params: dict = {"Level": level, "Vibrancy": vibrancy, **self._current_color_params(device)}
+        now = time.monotonic()
+        device["color_command_time"] = device["vibrancy_command_time"] = now
+        device.pop("pending_vibrancy", None)
+        self._notify_vibrancy(device_id)
+        await self._request(
+            "CreateRequest",
+            f"/zone/{device['zone']}/commandprocessor",
+            {"Command": {
+                "CommandType": "GoToSpectrumTuningLevel",
+                "SpectrumTuningLevelParameters": params,
+            }},
+        )
 
     async def _load_connect_bridge_device(self):
         """Load the bridge itself as devices['1'] without requiring AssociatedArea."""
