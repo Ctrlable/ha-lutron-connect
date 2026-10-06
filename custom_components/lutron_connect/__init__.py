@@ -12,10 +12,16 @@ from pylutron_caseta import BUTTON_STATUS_PRESSED
 from .smartbridge import ConnectSmartbridge
 
 from homeassistant import config_entries
-from homeassistant.const import ATTR_DEVICE_ID, ATTR_SUGGESTED_AREA, CONF_HOST, Platform
+from homeassistant.const import (
+    ATTR_DEVICE_ID,
+    ATTR_SUGGESTED_AREA,
+    CONF_HOST,
+    EVENT_HOMEASSISTANT_STARTED,
+    Platform,
+)
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryNotReady
-from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import device_registry as dr, issue_registry as ir
 from homeassistant.helpers.device_registry import DeviceInfo
 
 from .const import (
@@ -123,7 +129,34 @@ async def async_setup_entry(
     )
 
     await hass.config_entries.async_forward_entry_setups(config_entry, PLATFORMS)
+
+    # Ketra fixtures get a Vibrancy slider (number platform); the card, tile
+    # feature and light-dialog control are the free Ctrlable Vibrancy Card.
+    if any(d.get("type") == "SpectrumTune" for d in bridge.get_devices().values()):
+        if hass.is_running:
+            _async_check_vibrancy_card(hass)
+        else:
+            config_entry.async_on_unload(hass.bus.async_listen_once(
+                EVENT_HOMEASSISTANT_STARTED, lambda _e: _async_check_vibrancy_card(hass)))
     return True
+
+
+_CARD_DOMAIN = "ctrlable_vibrancy_card"
+_CARD_ISSUE = "install_vibrancy_card"
+
+
+@callback
+def _async_check_vibrancy_card(hass: HomeAssistant) -> None:
+    if hass.config_entries.async_entries(_CARD_DOMAIN):
+        ir.async_delete_issue(hass, DOMAIN, _CARD_ISSUE)
+        return
+    ir.async_create_issue(
+        hass, DOMAIN, _CARD_ISSUE,
+        is_fixable=False,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key=_CARD_ISSUE,
+        learn_more_url="https://portal.ctrlable.com/docs/vibrancy-card",
+    )
 
 
 async def async_unload_entry(

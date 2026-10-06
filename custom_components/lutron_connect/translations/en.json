@@ -20,5 +20,11 @@
       "already_configured": "This bridge is already configured.",
       "not_lutron_device": "Discovered device is not a Lutron device."
     }
+  },
+  "issues": {
+    "install_vibrancy_card": {
+      "title": "Install Ctrlable Vibrancy Card",
+      "description": "Your Ketra fixtures now have a Vibrancy slider on their device page. For the Vibrancy card, the tile card feature and the Vibrancy control in the light dialog, install the free **Ctrlable Vibrancy Card** from the Ctrlable Store and add it under Devices & Services."
+    }
   }
 }
