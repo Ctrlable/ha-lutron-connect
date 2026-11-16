@@ -13,7 +13,7 @@ A Home Assistant custom integration for the **Lutron Connect Bridge** (used with
 - **Fans** — Low / Medium / MediumHigh / High speed
 - **Scenes** — all LEAP virtual buttons / scenes
 - **Occupancy sensors** — motion/occupancy groups as binary sensors
-- **Keypad button events** — fires `lutron_caseta_button_event` on every keypad press/release, compatible with [ha-lutron-keypad-controller](https://github.com/Ctrlable/ha-lutron-keypad-controller)
+- **Keypad button events** — fires `lutron_connect_button_event` on every keypad press/release, compatible with [ha-lutron-keypad-controller](https://github.com/Ctrlable/ha-lutron-keypad-controller) (Buttons Machine)
 
 ---
 
@@ -51,7 +51,7 @@ Certificates are stored in your HA config directory as `lutron_connect-{bridge_i
 
 ## Keypad Controller compatibility
 
-This integration fires the standard `lutron_caseta_button_event` HA event on every keypad button press and release, with the same payload as the built-in `lutron_caseta` integration:
+This integration fires `lutron_connect_button_event` on every keypad button press and release. The payload uses the same keys as the built-in `lutron_caseta` integration's button event:
 
 | Field | Description |
 |---|---|
@@ -65,7 +65,23 @@ This integration fires the standard `lutron_caseta_button_event` HA event on eve
 | `button_type` | Button label/name |
 | `action` | `press` or `release` |
 
-[ha-lutron-keypad-controller](https://github.com/Ctrlable/ha-lutron-keypad-controller) works with this integration without any changes — it listens for the same event regardless of which Lutron integration fires it.
+Example automation trigger:
+
+```yaml
+triggers:
+  - trigger: event
+    event_type: lutron_connect_button_event
+    event_data:
+      device_id: <keypad device id>
+      leap_button_number: 1
+      action: press
+```
+
+[ha-lutron-keypad-controller](https://github.com/Ctrlable/ha-lutron-keypad-controller) (Buttons Machine) listens for `lutron_connect_button_event` as well as `lutron_caseta_button_event`.
+
+### Upgrading from 1.1.x
+
+Up to v1.1.x this integration fired core Caseta's event name, `lutron_caseta_button_event`. Since v1.2.0 it fires only `lutron_connect_button_event`, with the same payload. Automations that trigger on the old name no longer run for Connect keypads. At startup the integration looks for such automations and, if the site has no `lutron_caseta` bridge of its own, raises a Repairs notice listing them. Change each one's `event_type` to `lutron_connect_button_event`; nothing else needs editing. Automations are never rewritten automatically.
 
 ---
 

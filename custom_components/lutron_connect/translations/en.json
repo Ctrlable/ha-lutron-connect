@@ -25,6 +25,10 @@
     "install_vibrancy_card": {
       "title": "Install Ctrlable Vibrancy Card",
       "description": "Your Ketra fixtures now have a Vibrancy slider on their device page. For the Vibrancy card, the tile card feature and the Vibrancy control in the light dialog, install the free **Ctrlable Vibrancy Card** from the Ctrlable Store and add it under Devices & Services."
+    },
+    "legacy_caseta_button_event": {
+      "title": "Automations still use the old Lutron button event",
+      "description": "Lutron Connect keypads now fire `{new_event}`. They no longer fire `{old_event}`, and this site has no Lutron Caseta bridge that fires it, so these automations will not run on a keypad press:\n\n{automations}\n\nOpen each automation in Ctrlable Pro and change its event trigger from `{old_event}` to `{new_event}`. The event data is unchanged, so nothing else needs editing. This notice clears after the next restart once no automation uses the old event."
     }
   }
 }

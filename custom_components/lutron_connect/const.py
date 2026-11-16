@@ -6,8 +6,12 @@ CONF_KEYFILE = "keyfile"
 CONF_CERTFILE = "certfile"
 CONF_CA_CERTS = "ca_certs"
 
-# Fire the same event name as lutron_caseta so ha-lutron-keypad-controller works unchanged.
-LUTRON_CASETA_BUTTON_EVENT = "lutron_caseta_button_event"
+# Keypad press/release event. Lutron Connect is its own product, so it fires its
+# own event name; the payload keys match core lutron_caseta's button event so
+# keypad controllers (Buttons Machine) read both the same way.
+LUTRON_CONNECT_BUTTON_EVENT = "lutron_connect_button_event"
+# Name fired up to v1.1.x. Only used to find automations still listening to it.
+LEGACY_CASETA_BUTTON_EVENT = "lutron_caseta_button_event"
 
 BRIDGE_DEVICE_ID = "1"
 

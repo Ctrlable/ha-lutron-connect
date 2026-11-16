@@ -12,7 +12,7 @@ from .const import (
     ATTR_DEVICE_NAME,
     ATTR_LEAP_BUTTON_NUMBER,
     DOMAIN,
-    LUTRON_CASETA_BUTTON_EVENT,
+    LUTRON_CONNECT_BUTTON_EVENT,
 )
 
 
@@ -21,7 +21,7 @@ def async_describe_events(
     hass: HomeAssistant,
     async_describe_event: Callable[[str, str, Callable[[Event], dict[str, Any]]], None],
 ) -> None:
-    """Register a description for lutron_caseta_button_event in the logbook."""
+    """Register a description for lutron_connect_button_event in the logbook."""
 
     @callback
     def _describe(event: Event) -> dict[str, Any]:
@@ -35,4 +35,4 @@ def async_describe_events(
             "message": f"button {button} {action}",
         }
 
-    async_describe_event(DOMAIN, LUTRON_CASETA_BUTTON_EVENT, _describe)
+    async_describe_event(DOMAIN, LUTRON_CONNECT_BUTTON_EVENT, _describe)

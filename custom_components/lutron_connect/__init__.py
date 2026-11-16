@@ -9,6 +9,7 @@ from typing import Any, cast
 
 from pylutron_caseta import BUTTON_STATUS_PRESSED
 
+from .legacy_event import async_check_legacy_automations_later
 from .smartbridge import ConnectSmartbridge
 
 from homeassistant import config_entries
@@ -45,7 +46,7 @@ from .const import (
     CONFIG_URL,
     DOMAIN,
     LEAP_PORT,
-    LUTRON_CASETA_BUTTON_EVENT,
+    LUTRON_CONNECT_BUTTON_EVENT,
     MANUFACTURER,
     UNASSIGNED_AREA,
     link_to_bridge,
@@ -131,6 +132,9 @@ async def async_setup_entry(
     )
 
     await hass.config_entries.async_forward_entry_setups(config_entry, PLATFORMS)
+
+    # v1.2.0 renamed the button event; flag automations still on the old name.
+    async_check_legacy_automations_later(hass)
 
     # Ketra fixtures get a Vibrancy slider (number platform); the card, tile
     # feature and light-dialog control are the free Ctrlable Vibrancy Card.
@@ -309,12 +313,12 @@ def _async_subscribe_button_events(
         action = ACTION_PRESS if event_type == BUTTON_STATUS_PRESSED else ACTION_RELEASE
         _LOGGER.debug(
             "Firing %s: area=%s device=%s button=%s action=%s",
-            LUTRON_CASETA_BUTTON_EVENT,
+            LUTRON_CONNECT_BUTTON_EVENT,
             keypad.get("area_name"), keypad.get("name"),
             button.get("button_name"), action,
         )
         hass.bus.async_fire(
-            LUTRON_CASETA_BUTTON_EVENT,
+            LUTRON_CONNECT_BUTTON_EVENT,
             {
                 ATTR_SERIAL: keypad["serial"],
                 ATTR_TYPE: keypad["type"],
